@@ -105,11 +105,18 @@ Toy SFT over the public Ganker API runs through a dedicated Modal app:
 source ~/.codex/modal.env
 modal run modal_apps/sft.py --mode env
 modal run modal_apps/sft.py --mode toy-sft
+modal run modal_apps/sft.py --mode hf-small-sft --max-steps 1 --sequence-length 32
 ```
 
 The first SFT path lives under `examples/sft/`, uses a deterministic toy
 tokenizer, converts `examples/tiny_sft.jsonl` into `Datum` batches, and drives
 `ServiceClient -> TrainingClient` with full fine-tuning semantics against the
 tiny Megatron-Core runtime.
+
+The `hf-small-sft` mode runs Qwen3 0.6B through Megatron Bridge inside the
+NVIDIA NeMo container (`GANKER_MODAL_BRIDGE_IMAGE`, default
+`nvcr.io/nvidia/nemo:25.09.02`). It loads pretrained HF weights, performs a
+full fine-tuning step through the same public Ganker client path, and exports a
+full HF checkpoint directory with `pytorch_model.bin`.
 
 See `architecture/` for the local orchestration diagrams.

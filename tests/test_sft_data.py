@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from examples.sft.data import (
+    HFAutoTokenizerAdapter,
     SFTDataConfig,
     SFTExample,
     ToyTokenizer,
@@ -32,6 +33,25 @@ def test_load_jsonl_examples_validates_records(tmp_path: Path):
 
     with pytest.raises(ValueError, match="prompt must be a string"):
         load_jsonl_examples(path)
+
+
+def test_hf_tokenizer_adapter_uses_eos_for_missing_bos_and_pad():
+    class FakeHFTokenizer:
+        eos_token_id = 99
+        bos_token_id = None
+        pad_token_id = None
+
+        def encode(self, text, *, add_special_tokens):
+            assert text == "abc"
+            assert add_special_tokens is False
+            return [10, 11, 12]
+
+    adapter = HFAutoTokenizerAdapter(FakeHFTokenizer())
+
+    assert adapter.eos_token_id == 99
+    assert adapter.bos_token_id == 99
+    assert adapter.pad_token_id == 99
+    assert adapter.encode("abc") == [10, 11, 12]
 
 
 def test_encode_sft_example_shifts_targets_and_masks_completion_boundary():
@@ -99,4 +119,3 @@ def test_load_jsonl_sft_batches_uses_toy_tokenizer_and_fixed_lengths(tmp_path: P
 def test_batch_datums_rejects_empty_iterable():
     with pytest.raises(ValueError, match="no SFT datums"):
         batch_datums([], batch_size=1)
-

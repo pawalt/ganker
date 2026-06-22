@@ -24,6 +24,7 @@ REMOTE_ROOT = Path("/workspace/ganker")
 PYTHON_VERSION = os.getenv("GANKER_MODAL_PYTHON", "3.12")
 GPU = os.getenv("GANKER_MODAL_GPU", "L40S")
 BASE_IMAGE = os.getenv("GANKER_MODAL_BASE_IMAGE", "")
+BRIDGE_BASE_IMAGE = os.getenv("GANKER_MODAL_BRIDGE_IMAGE", "nvcr.io/nvidia/nemo:25.09.02")
 
 
 def _base_image():
@@ -67,7 +68,34 @@ def _common_image():
     )
 
 
+def _bridge_image():
+    return (
+        modal.Image.from_registry(BRIDGE_BASE_IMAGE)
+        .run_commands("python -m pip install --no-deps torchmonarch==0.4.0")
+        .env(
+            {
+                "PYTHONPATH": f"{REMOTE_ROOT}:{REMOTE_ROOT / 'src'}",
+                "GANKER_ARTIFACT_ROOT": "/tmp/ganker-artifacts",
+            }
+        )
+        .add_local_dir(
+            PROJECT_ROOT,
+            remote_path=str(REMOTE_ROOT),
+            ignore=[
+                ".git",
+                ".jj",
+                ".venv",
+                ".pytest_cache",
+                ".ruff_cache",
+                "__pycache__",
+                ".local_artifacts",
+            ],
+        )
+    )
+
+
 image = _common_image()
+bridge_image = _bridge_image()
 app = modal.App("ganker-sft")
 
 
@@ -166,6 +194,87 @@ def _run_toy_sft(
             client.close()
 
 
+def _run_hf_small_sft(
+    *,
+    dataset_path: str,
+    artifact_root: str,
+    base_model: str,
+    max_steps: int,
+    save_every: int,
+    learning_rate: float,
+    sequence_length: int,
+    micro_batch_size: int,
+    seed: int,
+) -> dict[str, Any]:
+    _add_remote_import_paths()
+
+    from examples.sft import HFAutoTokenizerAdapter, SFTDataConfig, load_jsonl_sft_batches, run_sft
+    from ganker import ServiceClient
+
+    tokenizer = HFAutoTokenizerAdapter.from_pretrained(base_model)
+    batches = load_jsonl_sft_batches(
+        dataset_path,
+        tokenizer=tokenizer,
+        config=SFTDataConfig(
+            sequence_length=sequence_length,
+            batch_size=micro_batch_size,
+            shuffle=True,
+            seed=seed,
+        ),
+    )
+
+    client = None
+    try:
+        client = ServiceClient.local(
+            Path(artifact_root),
+            training_backend="megatron",
+            training_backend_config={
+                "runtime_kind": "bridge",
+                "tensor_device": "cuda",
+                "micro_batch_size": micro_batch_size,
+                "global_batch_size": micro_batch_size,
+                "sequence_length": sequence_length,
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "seed": seed,
+                "trust_remote_code": True,
+                "load_weights": True,
+            },
+            timeout=60,
+        )
+        summary = run_sft(
+            client,
+            base_model=base_model,
+            dataset=batches,
+            tuning="full",
+            lora_rank=0,
+            learning_rate=learning_rate,
+            max_steps=max_steps,
+            save_every=save_every,
+        )
+        payload = {
+            "ok": True,
+            "mode": "hf-small-sft",
+            "runtime_kind": "bridge",
+            "dataset_path": dataset_path,
+            "batch_count": len(batches),
+            **summary.to_dict(),
+        }
+        payload["artifact_exists"] = Path(summary.artifact_path).exists()
+        if payload["artifact_exists"]:
+            artifact_payload = json.loads(Path(summary.artifact_path).read_text())
+            hf_checkpoint_path = artifact_payload.get("hf_checkpoint_path")
+            if hf_checkpoint_path:
+                payload["hf_checkpoint_path"] = hf_checkpoint_path
+                payload["hf_checkpoint_exists"] = Path(hf_checkpoint_path).exists()
+                payload["hf_checkpoint_bytes"] = artifact_payload.get("hf_checkpoint_bytes")
+                payload["hf_weight_count"] = artifact_payload.get("hf_weight_count")
+        return _json_safe(payload)
+    finally:
+        if client is not None:
+            client.close()
+
+
 @app.function(gpu=GPU, image=image, timeout=60 * 60)
 def run_remote(
     mode: str,
@@ -202,12 +311,41 @@ def run_remote(
     raise ValueError(f"unknown mode: {mode}")
 
 
+@app.function(gpu=GPU, image=bridge_image, timeout=60 * 60)
+def run_bridge_remote(
+    mode: str,
+    dataset_path: str,
+    artifact_root: str,
+    base_model: str,
+    max_steps: int,
+    save_every: int,
+    learning_rate: float,
+    sequence_length: int,
+    micro_batch_size: int,
+    seed: int,
+) -> dict[str, Any]:
+    if mode == "hf-small-sft":
+        return _run_hf_small_sft(
+            dataset_path=dataset_path,
+            artifact_root=artifact_root,
+            base_model=base_model,
+            max_steps=max_steps,
+            save_every=save_every,
+            learning_rate=learning_rate,
+            sequence_length=sequence_length,
+            micro_batch_size=micro_batch_size,
+            seed=seed,
+        )
+    raise ValueError(f"unknown bridge mode: {mode}")
+
+
 @app.local_entrypoint()
 def main(
     mode: str = "toy-sft",
     dataset_path: str = str(REMOTE_ROOT / "examples" / "tiny_sft.jsonl"),
     artifact_root: str = "/tmp/ganker-sft",
-    max_steps: int = 4,
+    base_model: str = "Qwen/Qwen3-0.6B",
+    max_steps: int = 1,
     save_every: int = 0,
     learning_rate: float = 1e-4,
     sequence_length: int = 64,
@@ -218,19 +356,33 @@ def main(
     vocab_size: int = 128,
     seed: int = 1234,
 ):
-    result = run_remote.remote(
-        mode,
-        dataset_path,
-        artifact_root,
-        max_steps,
-        save_every,
-        learning_rate,
-        sequence_length,
-        micro_batch_size,
-        hidden_size,
-        num_layers,
-        num_attention_heads,
-        vocab_size,
-        seed,
-    )
+    if mode == "hf-small-sft":
+        result = run_bridge_remote.remote(
+            mode,
+            dataset_path,
+            artifact_root,
+            base_model,
+            max_steps,
+            save_every,
+            learning_rate,
+            sequence_length,
+            micro_batch_size,
+            seed,
+        )
+    else:
+        result = run_remote.remote(
+            mode,
+            dataset_path,
+            artifact_root,
+            max_steps,
+            save_every,
+            learning_rate,
+            sequence_length,
+            micro_batch_size,
+            hidden_size,
+            num_layers,
+            num_attention_heads,
+            vocab_size,
+            seed,
+        )
     print(result)

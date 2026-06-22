@@ -1,6 +1,7 @@
 """Small supervised fine-tuning helpers for example workflows."""
 
 from .data import (
+    HFAutoTokenizerAdapter,
     SFTDataConfig,
     SFTExample,
     ToyTokenizer,
@@ -12,6 +13,7 @@ from .data import (
 from .loop import SFTRunSummary, run_sft
 
 __all__ = [
+    "HFAutoTokenizerAdapter",
     "SFTDataConfig",
     "SFTExample",
     "SFTRunSummary",
@@ -22,4 +24,3 @@ __all__ = [
     "load_jsonl_sft_batches",
     "run_sft",
 ]
-

@@ -46,7 +46,7 @@ def start_local_monarch_mesh(
 
     enable_transport(transport)
     host = this_host()
-    procs = host.spawn_procs(name="ganker-local")
+    procs = host.spawn_procs(name="ganker_local")
     root = str(Path(artifact_root))
     if isinstance(training_backend_config, MegatronBackendConfig):
         training_config = training_backend_config.as_dict()

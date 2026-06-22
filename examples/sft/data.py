@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import importlib
 import json
 from pathlib import Path
 import random
@@ -61,6 +62,40 @@ class ToyTokenizer:
     def encode(self, text: str) -> list[int]:
         bucket_count = self.vocab_size - 3
         return [3 + (byte % bucket_count) for byte in text.encode("utf-8")]
+
+
+class HFAutoTokenizerAdapter:
+    """Adapter from Hugging Face tokenizers to the example SFT tokenizer protocol."""
+
+    def __init__(self, tokenizer: Any):
+        self.tokenizer = tokenizer
+        eos_token_id = tokenizer.eos_token_id
+        if eos_token_id is None:
+            raise ValueError("Hugging Face tokenizer must define eos_token_id")
+        self.eos_token_id = int(eos_token_id)
+        self.pad_token_id = int(tokenizer.pad_token_id or eos_token_id)
+        self.bos_token_id = int(tokenizer.bos_token_id or eos_token_id)
+
+    @classmethod
+    def from_pretrained(cls, model_name_or_path: str) -> "HFAutoTokenizerAdapter":
+        AutoTokenizer = importlib.import_module("transformers").AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=True,
+        )
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        return cls(tokenizer)
+
+    def encode(self, text: str) -> list[int]:
+        return [
+            int(token)
+            for token in self.tokenizer.encode(
+                text,
+                add_special_tokens=False,
+            )
+        ]
 
 
 def load_jsonl_examples(path: str | Path) -> list[SFTExample]:
@@ -192,4 +227,3 @@ def load_jsonl_sft_batches(
         if (datum := encode_sft_example(example, tokenizer=tokenizer, config=config)) is not None
     ]
     return batch_datums(datums, batch_size=config.batch_size)
-

@@ -57,6 +57,7 @@ class MegatronRunHandle:
     forward_backward_schedule: Any = None
     config: Any = None
     distributed_context: Any = None
+    base_model: str = ""
 
 
 class _RunStatus(Enum):
@@ -153,12 +154,72 @@ class InstalledMegatronBridgeRuntime:
             base_model,
             trust_remote_code=config.trust_remote_code,
         )
-        provider = auto_bridge.to_megatron_provider(load_weights=config.load_weights)
+        provider = auto_bridge.to_megatron_provider(load_weights=False)
         provider.tensor_model_parallel_size = config.tensor_model_parallel_size
         provider.pipeline_model_parallel_size = config.pipeline_model_parallel_size
+        if hasattr(provider, "seq_length"):
+            provider.seq_length = config.sequence_length
+        if hasattr(provider, "micro_batch_size"):
+            provider.micro_batch_size = config.micro_batch_size
+        if hasattr(provider, "global_batch_size"):
+            provider.global_batch_size = config.global_batch_size
+
+        # Unit tests use a fake provider to validate config mapping without
+        # requiring torch, Megatron, CUDA, or model downloads.
+        if not hasattr(provider, "provide_distributed_model"):
+            if hasattr(provider, "finalize"):
+                provider.finalize()
+            return MegatronRunHandle(
+                bridge=auto_bridge,
+                provider=provider,
+                base_model=base_model,
+            )
+
+        torch = _import_torch()
+        device = _resolve_device(config.tensor_device, torch)
+        _initialize_distributed(
+            device=device,
+            tensor_parallel=config.tensor_model_parallel_size,
+            pipeline_parallel=config.pipeline_model_parallel_size,
+        )
+        torch.manual_seed(config.seed)
+        if device == "cuda":
+            from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+            model_parallel_cuda_manual_seed(config.seed)
+
+        if device == "cuda":
+            if hasattr(provider, "bf16"):
+                provider.bf16 = True
+            if hasattr(provider, "fp16"):
+                provider.fp16 = False
+            if hasattr(provider, "params_dtype"):
+                provider.params_dtype = torch.bfloat16
+            if hasattr(provider, "pipeline_dtype"):
+                provider.pipeline_dtype = torch.bfloat16
         if hasattr(provider, "finalize"):
             provider.finalize()
-        return MegatronRunHandle(bridge=auto_bridge, provider=provider)
+
+        from megatron.core.distributed import DistributedDataParallelConfig
+        from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+
+        model = auto_bridge.to_megatron_model(
+            load_weights=config.load_weights,
+            hf_path=base_model if config.load_weights else None,
+            ddp_config=DistributedDataParallelConfig(),
+            wrap_with_ddp=True,
+        )
+
+        optimizer = torch.optim.Adam(_model_parameters(model), lr=1e-4)
+        return MegatronRunHandle(
+            bridge=auto_bridge,
+            provider=provider,
+            model=model,
+            optimizer=optimizer,
+            forward_backward_schedule=get_forward_backward_func(),
+            config={"device": device, "runtime": "megatron-bridge"},
+            base_model=base_model,
+        )
 
     def forward_backward(
         self,
@@ -168,11 +229,27 @@ class InstalledMegatronBridgeRuntime:
         loss_fn: str,
         loss_fn_config: dict[str, float],
     ) -> ForwardBackwardOutput:
-        _ = handle, batch, loss_fn, loss_fn_config
-        raise BackendUnavailableError(
-            "real Megatron forward/backward requires a GPU worker runtime; "
-            "use the CPU preflight tests locally or the Modal GPU test path"
+        _ = loss_fn_config
+        if loss_fn != "cross_entropy":
+            raise InvalidRequestError(f"unsupported Megatron Bridge loss_fn: {loss_fn}")
+        if handle.model is None or handle.optimizer is None or handle.forward_backward_schedule is None:
+            raise BackendUnavailableError("Megatron Bridge runtime handle is not initialized")
+
+        sequence_length = int(batch.input_ids.shape[1])
+        micro_batch_size = int(batch.input_ids.shape[0])
+        handle.optimizer.zero_grad(set_to_none=True)
+        losses_reduced = handle.forward_backward_schedule(
+            forward_step_func=_core_forward_step_func,
+            data_iterator=iter([_core_runtime_batch(batch)]),
+            model=handle.model,
+            num_microbatches=1,
+            seq_length=sequence_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=sequence_length,
+            forward_only=False,
         )
+        loss = _extract_loss(losses_reduced)
+        return ForwardBackwardOutput(loss=loss, metrics={"loss": loss})
 
     def optim_step(
         self,
@@ -180,10 +257,12 @@ class InstalledMegatronBridgeRuntime:
         handle: MegatronRunHandle,
         params: AdamParams,
     ) -> None:
-        _ = handle, params
-        raise BackendUnavailableError(
-            "real Megatron optimizer steps require a GPU worker runtime"
-        )
+        if handle.optimizer is None:
+            raise BackendUnavailableError("Megatron Bridge optimizer is not initialized")
+        for group in handle.optimizer.param_groups:
+            group["lr"] = params.learning_rate
+        handle.optimizer.step()
+        handle.optimizer.zero_grad(set_to_none=True)
 
     def save_weights(
         self,
@@ -193,13 +272,29 @@ class InstalledMegatronBridgeRuntime:
         checkpoint_version: int,
         kind: ArtifactKind,
     ) -> dict[str, Any]:
-        _ = handle, run_id, checkpoint_version, kind
-        raise BackendUnavailableError(
-            "real Megatron checkpoint writing requires a GPU worker runtime"
+        _ = kind
+        if handle.bridge is None or handle.model is None:
+            raise BackendUnavailableError("Megatron Bridge model is not initialized")
+        checkpoint_dir = Path(os.getenv("GANKER_ARTIFACT_ROOT", "/tmp/ganker-artifacts"))
+        checkpoint_dir = checkpoint_dir / "hf-full" / run_id / f"checkpoint-{checkpoint_version:06d}"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        hf_payload = _save_bridge_hf_checkpoint(
+            bridge=handle.bridge,
+            model=handle.model,
+            base_model=handle.base_model,
+            checkpoint_dir=checkpoint_dir,
         )
+        return {
+            "backend": "megatron-bridge",
+            "runtime": "megatron-bridge",
+            "artifact_format": "hf-full",
+            "checkpoint_path": str(checkpoint_dir),
+            **hf_payload,
+        }
 
     def shutdown(self, *, handle: MegatronRunHandle) -> None:
-        _ = handle
+        if handle.model is not None:
+            _destroy_distributed()
 
 
 class InProcessMegatronCoreRuntime:
@@ -427,6 +522,58 @@ def _import_torch():
     except ImportError as exc:
         raise BackendUnavailableError("torch is required for Megatron-Core runtime") from exc
     return torch
+
+
+def _model_parameters(model: Any):
+    chunks = model if isinstance(model, list) else [model]
+    for chunk in chunks:
+        yield from chunk.parameters()
+
+
+def _save_bridge_hf_checkpoint(
+    *,
+    bridge: Any,
+    model: Any,
+    base_model: str,
+    checkpoint_dir: Path,
+) -> dict[str, Any]:
+    torch = _import_torch()
+    from transformers import AutoConfig, AutoTokenizer
+
+    config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+    config.save_pretrained(checkpoint_dir)
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+    tokenizer.save_pretrained(checkpoint_dir)
+
+    try:
+        from transformers import GenerationConfig
+
+        generation_config = GenerationConfig.from_pretrained(
+            base_model,
+            trust_remote_code=True,
+        )
+        generation_config.save_pretrained(checkpoint_dir)
+    except Exception:
+        pass
+
+    state_dict = {}
+    for item in bridge.export_hf_weights(model, cpu=True, show_progress=False):
+        name = getattr(item, "param_name", None)
+        weight = getattr(item, "weight", None)
+        if name is None or weight is None:
+            name, weight = item
+        state_dict[str(name)] = weight.detach().cpu().clone()
+
+    weights_path = checkpoint_dir / "pytorch_model.bin"
+    torch.save(state_dict, weights_path)
+    return {
+        "hf_checkpoint_path": str(checkpoint_dir),
+        "hf_weights_path": str(weights_path),
+        "hf_checkpoint_bytes": sum(
+            path.stat().st_size for path in checkpoint_dir.rglob("*") if path.is_file()
+        ),
+        "hf_weight_count": len(state_dict),
+    }
 
 
 def _free_port() -> int:
