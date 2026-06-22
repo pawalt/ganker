@@ -10,7 +10,7 @@ import uuid
 
 import grpc
 
-from ganker.config import MegatronBackendConfig
+from ganker.config import MegatronBackendConfig, SGLangBackendConfig
 from ganker.contracts import (
     ArtifactFileKind,
     DownloadArtifactFileResponse,
@@ -199,7 +199,7 @@ def start_grpc_proxy_server(
     training_backend: str = "fake",
     inference_backend: str = "fake",
     training_backend_config: dict | MegatronBackendConfig | None = None,
-    inference_backend_config: dict | None = None,
+    inference_backend_config: dict | SGLangBackendConfig | None = None,
     timeout: float = 20,
     bearer_token: str | None = None,
     max_workers: int = 8,

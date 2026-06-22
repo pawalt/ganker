@@ -33,6 +33,9 @@ uv run pytest
 - Production inference is expected to use `sglang` behind `InferenceBackend`.
 - Local development and tests must keep working without Megatron, `sglang`, CUDA, model weights, or checkpoints.
 - Heavy backend imports must stay isolated in their adapter modules.
+- The SGLang inference backend talks to SGLang over HTTP and must remain import-isolated; importing `ganker.backends.sglang` must not import `sglang`.
+- SGLang local tests should inject `SGLangRuntime` or `SGLangHTTPClient` fakes and assert `/generate`, `/load_lora_adapter`, and artifact contract behavior without starting a model server.
+- SGLang-compatible artifacts are HF safetensors full checkpoints, HF/PEFT LoRA adapters, or base-model payloads. Raw Megatron checkpoint artifacts should fail clearly until an export step produces one of those formats.
 - The Megatron backend owns a stateful runtime lifecycle: one active run per actor, `forward_backward` moves to pending gradients, `optim_step` consumes pending gradients, and `save_weights` is allowed only from ready state.
 - `runtime_kind="core"` is the Modal smoke path and uses Megatron-Core directly. `runtime_kind="bridge"` remains the default for future Bridge/HF conversion work.
 - Test Megatron lifecycle behavior with injected runtimes; do not require real Megatron imports for lifecycle unit tests.
@@ -46,6 +49,7 @@ uv run pytest
 - Real Megatron execution smoke tests should run through Modal/GPU infrastructure, not the default local suite. Use `source ~/.codex/modal.env` and `modal run modal_apps/megatron_smoke.py --mode megatron`.
 - Remote mesh smoke tests live in `modal_apps/remote_mesh.py`. Use `modal run modal_apps/remote_mesh.py --mode grpc-smoke-fake` for fake backends, `--mode grpc-smoke-qwen-lora` for Bridge/GPU, and `--mode serve` for a singleton gRPC server behind a Modal tunnel.
 - Modal smoke implementation lives in `tests/modal_smoke/` as importable test helpers. `scripts/megatron_bridge_smoke.py` is only a compatibility CLI wrapper, and `modal_apps/megatron_smoke.py` should call the importable helpers directly.
+- SGLang backend tests live in `tests/test_sglang_backend.py`; run them with `uv run pytest tests/test_sglang_backend.py` and do not require SGLang, CUDA, or model downloads.
 - Keep tests lightweight enough to run with `uv run pytest` on a CPU-only development machine.
 
 ## gRPC Codegen

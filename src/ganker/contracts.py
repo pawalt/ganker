@@ -29,13 +29,22 @@ class RequestContext:
 
 @dataclass(frozen=True)
 class ModelInput:
-    """Tokenized model input for a single datum or sampling prompt."""
+    """Model input for a single datum or sampling prompt.
+
+    Training requests use `token_ids`. Sampling requests may use either
+    `token_ids` or `text`, depending on the rollout backend.
+    """
 
     token_ids: list[int] = field(default_factory=list)
+    text: str = ""
 
     @classmethod
     def from_ints(cls, tokens: Iterable[int]) -> "ModelInput":
         return cls(token_ids=[int(token) for token in tokens])
+
+    @classmethod
+    def from_text(cls, text: str) -> "ModelInput":
+        return cls(text=str(text))
 
 
 @dataclass(frozen=True)
@@ -72,11 +81,13 @@ class Datum:
 class SamplingParams:
     max_tokens: int = 16
     temperature: float = 1.0
+    top_p: float = 1.0
     stop: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class SampledSequence:
+    text: str = ""
     tokens: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     stop_reason: str = "length"

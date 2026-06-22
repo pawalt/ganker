@@ -92,10 +92,16 @@ class FakeProxyTransport:
         return SampleResponse(
             request_id=request.context.request_id,
             run_id=request.run_id,
-            sequences=[SampledSequence(tokens=[1, 2], logprobs=[-0.1, -0.1])],
+            sequences=[
+                SampledSequence(
+                    text=f"{request.prompt.text}<fake>" if request.prompt.text else "",
+                    tokens=[1, 2],
+                    logprobs=[-0.1, -0.1],
+                )
+            ],
             artifact=self.artifact,
             usage=Usage(
-                input_tokens=len(request.prompt.token_ids),
+                input_tokens=len(request.prompt.token_ids) or len(request.prompt.text.split()),
                 output_tokens=request.sampling_params.max_tokens,
                 samples=request.num_samples,
             ),
@@ -151,8 +157,8 @@ def test_service_client_hides_proxy_transport_details():
     )
     sampling = training.save_weights_and_get_sampling_client(request_id="req-sampler")
     sample = sampling.sample(
-        ModelInput.from_ints([10]),
-        SamplingParams(max_tokens=2),
+        "hello",
+        SamplingParams(max_tokens=2, top_p=0.9),
         request_id="req-sample",
     )
     summary = sampling.get_telemetry_summary(request_id="req-summary")
@@ -162,6 +168,7 @@ def test_service_client_hides_proxy_transport_details():
     assert fb.usage.input_tokens == 3
     assert step.optimizer_step == 1
     assert sampling.artifact == transport.artifact
+    assert sample.sequences[0].text == "hello<fake>"
     assert sample.sequences[0].tokens == [1, 2]
     assert summary.summary.run_id == "run-1"
     assert [type(request).__name__ for request in transport.requests] == [
@@ -173,3 +180,21 @@ def test_service_client_hides_proxy_transport_details():
         "SampleRequest",
         "GetTelemetrySummaryRequest",
     ]
+    sample_request = transport.requests[-2]
+    assert isinstance(sample_request, SampleRequest)
+    assert sample_request.prompt.text == "hello"
+    assert sample_request.sampling_params.top_p == 0.9
+
+
+def test_sampling_client_sample_text_convenience():
+    transport = FakeProxyTransport()
+    service = ServiceClient(transport)
+    training = service.create_lora_training_client(base_model="Qwen/Qwen3-8B")
+    sampling = training.save_weights_and_get_sampling_client()
+
+    sample = sampling.sample_text("a prompt", SamplingParams(max_tokens=1))
+
+    assert sample.sequences[0].text == "a prompt<fake>"
+    sample_request = transport.requests[-1]
+    assert isinstance(sample_request, SampleRequest)
+    assert sample_request.prompt == ModelInput.from_text("a prompt")

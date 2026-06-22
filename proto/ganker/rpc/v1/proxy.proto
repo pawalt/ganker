@@ -37,6 +37,7 @@ message RequestContext {
 
 message ModelInput {
   repeated int64 token_ids = 1;
+  string text = 2;
 }
 
 message TensorData {
@@ -52,12 +53,14 @@ message SamplingParams {
   int64 max_tokens = 1;
   double temperature = 2;
   repeated string stop = 3;
+  double top_p = 4;
 }
 
 message SampledSequence {
   repeated int64 tokens = 1;
   repeated double logprobs = 2;
   string stop_reason = 3;
+  string text = 4;
 }
 
 message ForwardBackwardOutput {

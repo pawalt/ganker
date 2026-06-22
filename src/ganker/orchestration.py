@@ -9,7 +9,7 @@ from typing import Any
 from monarch.actor import enable_transport, this_host
 
 from ganker.actors import ProxyActor, RolloutActor, TelemetryActor, TrainingActor
-from ganker.config import MegatronBackendConfig
+from ganker.config import MegatronBackendConfig, SGLangBackendConfig
 
 
 @dataclass
@@ -37,7 +37,7 @@ def start_local_monarch_mesh(
     training_backend: str = "fake",
     inference_backend: str = "fake",
     training_backend_config: dict[str, Any] | MegatronBackendConfig | None = None,
-    inference_backend_config: dict[str, Any] | None = None,
+    inference_backend_config: dict[str, Any] | SGLangBackendConfig | None = None,
 ) -> LocalMonarchMesh:
     """Spawn the singleton actors on a local Monarch process mesh.
 
@@ -52,9 +52,13 @@ def start_local_monarch_mesh(
         training_config = training_backend_config.as_dict()
     else:
         training_config = training_backend_config
+    if isinstance(inference_backend_config, SGLangBackendConfig):
+        inference_config = inference_backend_config.as_dict()
+    else:
+        inference_config = inference_backend_config
 
     training = procs.spawn("training", TrainingActor, root, training_backend, training_config)
-    rollout = procs.spawn("rollout", RolloutActor, root, inference_backend, inference_backend_config)
+    rollout = procs.spawn("rollout", RolloutActor, root, inference_backend, inference_config)
     telemetry = procs.spawn("telemetry", TelemetryActor)
     proxy = procs.spawn("proxy", ProxyActor, training, rollout, telemetry)
 

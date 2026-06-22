@@ -20,3 +20,12 @@ def test_megatron_backend_module_import_does_not_import_megatron_or_torch():
 
     assert "megatron" not in sys.modules
     assert "torch" not in sys.modules
+
+
+def test_sglang_backend_module_import_does_not_import_sglang():
+    sys.modules.pop("ganker.backends.sglang", None)
+    sys.modules.pop("sglang", None)
+
+    import ganker.backends.sglang  # noqa: F401
+
+    assert "sglang" not in sys.modules

@@ -97,11 +97,14 @@ def context_from_proto(value: pb.RequestContext) -> RequestContext:
 
 
 def model_input_to_proto(value: ModelInput) -> pb.ModelInput:
-    return pb.ModelInput(token_ids=value.token_ids)
+    return pb.ModelInput(token_ids=value.token_ids, text=value.text)
 
 
 def model_input_from_proto(value: pb.ModelInput) -> ModelInput:
-    return ModelInput(token_ids=[int(token) for token in value.token_ids])
+    return ModelInput(
+        token_ids=[int(token) for token in value.token_ids],
+        text=value.text,
+    )
 
 
 def tensor_data_to_proto(value: TensorData) -> pb.TensorData:
@@ -137,6 +140,7 @@ def sampling_params_to_proto(value: SamplingParams) -> pb.SamplingParams:
         max_tokens=value.max_tokens,
         temperature=value.temperature,
         stop=value.stop,
+        top_p=value.top_p,
     )
 
 
@@ -144,6 +148,7 @@ def sampling_params_from_proto(value: pb.SamplingParams) -> SamplingParams:
     return SamplingParams(
         max_tokens=int(value.max_tokens),
         temperature=float(value.temperature),
+        top_p=float(value.top_p) if value.top_p else 1.0,
         stop=list(value.stop),
     )
 
@@ -153,11 +158,13 @@ def sampled_sequence_to_proto(value: SampledSequence) -> pb.SampledSequence:
         tokens=value.tokens,
         logprobs=value.logprobs,
         stop_reason=value.stop_reason,
+        text=value.text,
     )
 
 
 def sampled_sequence_from_proto(value: pb.SampledSequence) -> SampledSequence:
     return SampledSequence(
+        text=value.text,
         tokens=[int(token) for token in value.tokens],
         logprobs=list(value.logprobs),
         stop_reason=value.stop_reason,

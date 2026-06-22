@@ -112,3 +112,26 @@ def test_fake_inference_backend_can_pull_latest_without_explicit_refresh(tmp_pat
 
     assert sample.artifact.checkpoint_version == 1
     assert sample.sequences[0].tokens == [2, 3]
+
+
+def test_fake_inference_backend_samples_text_prompts(tmp_path: Path):
+    store = FilesystemArtifactStore(tmp_path)
+    store.write(
+        run_id="run-1",
+        checkpoint_version=3,
+        kind=ArtifactKind.DELTA,
+        payload={},
+    )
+    backend = FakeInferenceBackend(store)
+
+    sample = backend.sample(
+        run_id="run-1",
+        prompt=ModelInput.from_text("hello world"),
+        sampling_params=SamplingParams(max_tokens=2, top_p=0.8),
+        num_samples=2,
+    )
+
+    assert sample.sequences[0].text == "hello world<fake:3:0>"
+    assert sample.sequences[1].text == "hello world<fake:3:1>"
+    assert sample.usage.input_tokens == 2
+    assert sample.usage.output_tokens == 4

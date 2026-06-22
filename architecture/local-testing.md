@@ -43,6 +43,7 @@ unit tests
   contracts       plain dataclasses
   artifacts       filesystem store
   backends        fake training/inference
+  sglang backend  injected runtime/client, no SGLang server
   components      pure request/response behavior
   client          fake ProxyTransport
   telemetry       in-memory event ledger

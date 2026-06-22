@@ -217,6 +217,8 @@ class FakeInferenceBackend:
             raise InvalidRequestError("sampling_params.max_tokens must be positive")
         if num_samples <= 0:
             raise InvalidRequestError("num_samples must be positive")
+        if sampling_params.top_p <= 0 or sampling_params.top_p > 1:
+            raise InvalidRequestError("sampling_params.top_p must be in (0, 1]")
 
         artifact = self._loaded_artifacts.get(run_id)
         if artifact is None:
@@ -224,6 +226,7 @@ class FakeInferenceBackend:
             self._loaded_artifacts[run_id] = artifact
 
         base = prompt.token_ids[-1] if prompt.token_ids else 0
+        prompt_text = prompt.text
         sequences = []
         for sample_index in range(num_samples):
             tokens = [
@@ -236,12 +239,20 @@ class FakeInferenceBackend:
             ]
             sequences.append(
                 SampledSequence(
+                    text=(
+                        f"{prompt_text}<fake:{artifact.checkpoint_version}:{sample_index}>"
+                        if prompt_text
+                        else ""
+                    ),
                     tokens=tokens,
                     logprobs=[-0.1 for _ in tokens],
                 )
             )
+        input_tokens = len(prompt.token_ids)
+        if prompt_text and not input_tokens:
+            input_tokens = len(prompt_text.split()) or 1
         usage = Usage(
-            input_tokens=len(prompt.token_ids),
+            input_tokens=input_tokens,
             output_tokens=sampling_params.max_tokens * num_samples,
             samples=num_samples,
         )

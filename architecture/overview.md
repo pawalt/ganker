@@ -30,8 +30,7 @@ client / training loop
         v                          v                          v
 +---------------------+    +----------------------+    +----------------+
 | TrainingBackend     |    | InferenceBackend     |    | TelemetryLedger|
-| fake now            |    | fake now             |    | in memory      |
-| Megatron later      |    | sglang later         |    |                |
+| fake / Megatron     |    | fake / SGLang HTTP   |    | in memory      |
 +---------------------+    +----------------------+    +----------------+
         |
         v
@@ -118,6 +117,24 @@ client -> ProxyTransport -> ProxyActor -> RolloutActor -> FakeInferenceBackend
                          |
                          v
                   ProxyActor -> TelemetryActor
+
+SGLang sampling uses the same client and actor path. The only difference is
+inside `RolloutActor`, where `SGLangInferenceBackend` reads the selected
+artifact payload, refreshes the SGLang runtime, and calls SGLang's HTTP
+`/generate` endpoint.
+
+```text
+SamplingClient.sample_text(...)
+        |
+        v
+ProxyActor -> RolloutActor -> SGLangInferenceBackend
+                              |
+                              +-- read WeightArtifact payload
+                              +-- load base HF checkpoint or LoRA adapter
+                              +-- POST /generate
+                              v
+                           SGLang server
+```
 
 download_artifact_file
 client -> ProxyTransport -> local file read or ProxyGrpcServer -> FilesystemArtifactStore

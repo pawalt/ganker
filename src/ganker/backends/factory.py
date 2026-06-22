@@ -6,7 +6,7 @@ from typing import Any
 from ganker.artifacts import FilesystemArtifactStore
 from ganker.backends.base import InferenceBackend, TrainingBackend
 from ganker.backends.fake import FakeInferenceBackend, FakeTrainingBackend
-from ganker.config import MegatronBackendConfig
+from ganker.config import MegatronBackendConfig, SGLangBackendConfig
 from ganker.errors import InvalidRequestError
 
 
@@ -39,13 +39,22 @@ def build_inference_backend(
     kind: str,
     artifact_root: Path,
     *,
-    config: dict[str, Any] | None = None,
+    config: dict[str, Any] | SGLangBackendConfig | None = None,
 ) -> InferenceBackend:
-    _ = config
     if kind == "fake":
         return FakeInferenceBackend(FilesystemArtifactStore(artifact_root))
     if kind == "sglang":
         from ganker.backends.sglang import SGLangInferenceBackend
 
-        return SGLangInferenceBackend(FilesystemArtifactStore(artifact_root))
+        if isinstance(config, SGLangBackendConfig):
+            sglang_config = config
+        else:
+            try:
+                sglang_config = SGLangBackendConfig.from_mapping(config)
+            except ValueError as exc:
+                raise InvalidRequestError(str(exc)) from exc
+        return SGLangInferenceBackend(
+            FilesystemArtifactStore(artifact_root),
+            config=sglang_config,
+        )
     raise InvalidRequestError(f"unknown inference backend: {kind}")

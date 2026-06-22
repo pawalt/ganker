@@ -11,6 +11,7 @@ from ganker.contracts import (
     RefreshWeightsRequest,
     RequestContext,
     SampleRequest,
+    SampledSequence,
     SamplingParams,
     SaveWeightsRequest,
     TensorData,
@@ -82,8 +83,13 @@ def test_optimizer_sampling_and_artifact_requests_proto_round_trip():
         SampleRequest(
             context=RequestContext("req-sample"),
             run_id="run-1",
-            prompt=ModelInput.from_ints([10, 11]),
-            sampling_params=SamplingParams(max_tokens=3, temperature=0.7, stop=["</s>"]),
+            prompt=ModelInput(token_ids=[10, 11], text="hello"),
+            sampling_params=SamplingParams(
+                max_tokens=3,
+                temperature=0.7,
+                top_p=0.9,
+                stop=["</s>"],
+            ),
             num_samples=2,
         ),
         DownloadArtifactFileRequest(
@@ -106,6 +112,17 @@ def test_optimizer_sampling_and_artifact_requests_proto_round_trip():
     assert conv.download_artifact_file_request_from_proto(
         conv.download_artifact_file_request_to_proto(requests[4])
     ) == requests[4]
+
+
+def test_sampled_sequence_proto_round_trips_text_and_tokens():
+    sequence = SampledSequence(
+        text="hello world",
+        tokens=[1, 2],
+        logprobs=[-0.2, -0.1],
+        stop_reason="stop",
+    )
+
+    assert conv.sampled_sequence_from_proto(conv.sampled_sequence_to_proto(sequence)) == sequence
 
 
 def test_refresh_weights_without_artifact_round_trips():

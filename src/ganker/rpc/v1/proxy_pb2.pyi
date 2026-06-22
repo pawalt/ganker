@@ -21,7 +21,13 @@ class RequestContext(Message):
 
 class ModelInput(Message):
     token_ids: MutableSequence[int]
-    def __init__(self, *, token_ids: MutableSequence[int] | None = ...) -> None: ...
+    text: str
+    def __init__(
+        self,
+        *,
+        token_ids: MutableSequence[int] | None = ...,
+        text: str = ...,
+    ) -> None: ...
 
 
 class TensorData(Message):
@@ -44,12 +50,14 @@ class SamplingParams(Message):
     max_tokens: int
     temperature: float
     stop: MutableSequence[str]
+    top_p: float
     def __init__(
         self,
         *,
         max_tokens: int = ...,
         temperature: float = ...,
         stop: MutableSequence[str] | None = ...,
+        top_p: float = ...,
     ) -> None: ...
 
 
@@ -57,12 +65,14 @@ class SampledSequence(Message):
     tokens: MutableSequence[int]
     logprobs: MutableSequence[float]
     stop_reason: str
+    text: str
     def __init__(
         self,
         *,
         tokens: MutableSequence[int] | None = ...,
         logprobs: MutableSequence[float] | None = ...,
         stop_reason: str = ...,
+        text: str = ...,
     ) -> None: ...
 
 

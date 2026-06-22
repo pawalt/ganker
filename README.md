@@ -31,6 +31,12 @@ with ServiceClient.local("/tmp/ganker-artifacts") as client:
         SamplingParams(max_tokens=8),
     )
     print(sample.sequences[0].tokens)
+
+    text_sample = sampling_client.sample_text(
+        "Write one sentence about Monarch.",
+        SamplingParams(max_tokens=16, temperature=0.7, top_p=0.9),
+    )
+    print(text_sample.sequences[0].text)
 ```
 
 Internally, the project models the high-level flows between:
@@ -56,6 +62,17 @@ uv run pytest
 
 The default suite stays CPU-only and does not require Megatron Bridge, `sglang`,
 CUDA, model weights, or checkpoints.
+
+SGLang backend contract tests also stay CPU-only by injecting fake HTTP/runtime
+objects:
+
+```bash
+uv run pytest tests/test_sglang_backend.py
+```
+
+The real SGLang adapter can either attach to an existing SGLang HTTP endpoint
+with `SGLangBackendConfig(base_url=...)` or launch
+`python -m sglang.launch_server` with `launch_server=True`.
 
 Megatron adapter preflight tests run locally without a GPU:
 

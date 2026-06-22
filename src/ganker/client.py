@@ -33,7 +33,7 @@ from ganker.contracts import (
     TuningMode,
     WeightArtifact,
 )
-from ganker.config import MegatronBackendConfig
+from ganker.config import MegatronBackendConfig, SGLangBackendConfig
 from ganker.orchestration import LocalMonarchMesh, start_local_monarch_mesh
 from ganker.transport import MonarchProxyTransport, ProxyTransport
 
@@ -47,9 +47,11 @@ def _tuning_mode(value: TuningMode | Literal["lora", "full"]) -> TuningMode:
     }[value]
 
 
-def _model_input(value: ModelInput | Sequence[int]) -> ModelInput:
+def _model_input(value: ModelInput | Sequence[int] | str) -> ModelInput:
     if isinstance(value, ModelInput):
         return value
+    if isinstance(value, str):
+        return ModelInput.from_text(value)
     return ModelInput.from_ints(value)
 
 
@@ -79,7 +81,7 @@ class ServiceClient:
         training_backend: str = "fake",
         inference_backend: str = "fake",
         training_backend_config: dict | MegatronBackendConfig | None = None,
-        inference_backend_config: dict | None = None,
+        inference_backend_config: dict | SGLangBackendConfig | None = None,
         timeout: float = 20,
     ) -> "ServiceClient":
         mesh = start_local_monarch_mesh(
@@ -341,7 +343,7 @@ class SamplingClient:
 
     def sample(
         self,
-        prompt: ModelInput | Sequence[int],
+        prompt: ModelInput | Sequence[int] | str,
         sampling_params: SamplingParams | None = None,
         *,
         num_samples: int = 1,
@@ -355,6 +357,21 @@ class SamplingClient:
                 sampling_params=sampling_params or SamplingParams(),
                 num_samples=num_samples,
             )
+        )
+
+    def sample_text(
+        self,
+        prompt: str,
+        sampling_params: SamplingParams | None = None,
+        *,
+        num_samples: int = 1,
+        request_id: str = "",
+    ) -> SampleResponse:
+        return self.sample(
+            ModelInput.from_text(prompt),
+            sampling_params,
+            num_samples=num_samples,
+            request_id=request_id,
         )
 
     def get_telemetry_summary(
