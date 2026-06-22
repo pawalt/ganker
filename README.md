@@ -64,8 +64,8 @@ uv run pytest -m megatron_cpu
 ```
 
 Those tests cover import isolation, backend config mapping, Datum-to-tensor
-conversion when torch is installed, and mocked Megatron backend lifecycle. They
-do not run real Megatron forward/backward.
+conversion when torch is installed, and the mocked Megatron runtime lifecycle.
+They do not run real Megatron forward/backward.
 
 Real Megatron execution should be tested through the future Modal GPU path:
 

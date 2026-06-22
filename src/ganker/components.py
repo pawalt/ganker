@@ -81,6 +81,11 @@ class TrainingComponent:
         artifact = self._backend.save_weights(run_id=request.run_id, kind=request.kind)
         return SaveWeightsResponse(request_id=request_id, artifact=artifact)
 
+    def shutdown(self) -> None:
+        close = getattr(self._backend, "close", None)
+        if close is not None:
+            close()
+
 
 class RolloutComponent:
     def __init__(self, backend: InferenceBackend):
@@ -109,6 +114,11 @@ class RolloutComponent:
             artifact=result.artifact,
             usage=result.usage,
         )
+
+    def shutdown(self) -> None:
+        close = getattr(self._backend, "close", None)
+        if close is not None:
+            close()
 
 
 class TelemetryLedger:

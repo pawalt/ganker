@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from itertools import count
 import importlib
+from threading import RLock
 from typing import Any, Protocol
 
 from ganker.artifacts import FilesystemArtifactStore
@@ -44,6 +46,21 @@ class MegatronTensorBatch:
 class MegatronRunHandle:
     bridge: Any
     provider: Any
+    model: Any = None
+    optimizer: Any = None
+    scheduler: Any = None
+    tokenizer: Any = None
+    forward_backward_schedule: Any = None
+    config: Any = None
+    distributed_context: Any = None
+
+
+class _RunStatus(Enum):
+    READY = "ready"
+    GRADIENTS_PENDING = "gradients_pending"
+    CHECKPOINTING = "checkpointing"
+    FAILED = "failed"
+    CLOSED = "closed"
 
 
 @dataclass
@@ -53,9 +70,11 @@ class _RunState:
     tuning_mode: TuningMode
     lora_rank: int
     handle: MegatronRunHandle
+    status: _RunStatus = _RunStatus.READY
     gradient_version: int = 0
     optimizer_step: int = 0
     checkpoint_version: int = 0
+    lock: RLock = field(default_factory=RLock, repr=False)
 
 
 class MegatronRuntime(Protocol):
@@ -95,6 +114,9 @@ class MegatronRuntime(Protocol):
         checkpoint_version: int,
         kind: ArtifactKind,
     ) -> dict[str, Any]:
+        ...
+
+    def shutdown(self, *, handle: MegatronRunHandle) -> None:
         ...
 
 
@@ -171,6 +193,9 @@ class InstalledMegatronBridgeRuntime:
         raise BackendUnavailableError(
             "real Megatron checkpoint writing requires a GPU worker runtime"
         )
+
+    def shutdown(self, *, handle: MegatronRunHandle) -> None:
+        _ = handle
 
 
 def is_megatron_bridge_available() -> bool:
@@ -269,6 +294,7 @@ class MegatronTrainingBackend:
         self._runtime = runtime or InstalledMegatronBridgeRuntime.from_installed()
         self._run_counter = count(1)
         self._runs: dict[str, _RunState] = {}
+        self._lock = RLock()
 
     def create_training_run(
         self,
@@ -286,22 +312,24 @@ class MegatronTrainingBackend:
         if tuning_mode == TuningMode.FULL and lora_rank < 0:
             raise InvalidRequestError("lora_rank cannot be negative")
 
-        handle = self._runtime.create_run(
-            base_model=base_model,
-            tuning_mode=tuning_mode,
-            lora_rank=lora_rank,
-            config=self._config,
-        )
-        run_id = f"meg-run-{next(self._run_counter):06d}"
-        state = _RunState(
-            run_id=run_id,
-            base_model=base_model,
-            tuning_mode=tuning_mode,
-            lora_rank=lora_rank,
-            handle=handle,
-        )
-        self._runs[run_id] = state
-        return self._run_message(state)
+        with self._lock:
+            self._ensure_no_active_run()
+            handle = self._runtime.create_run(
+                base_model=base_model,
+                tuning_mode=tuning_mode,
+                lora_rank=lora_rank,
+                config=self._config,
+            )
+            run_id = f"meg-run-{next(self._run_counter):06d}"
+            state = _RunState(
+                run_id=run_id,
+                base_model=base_model,
+                tuning_mode=tuning_mode,
+                lora_rank=lora_rank,
+                handle=handle,
+            )
+            self._runs[run_id] = state
+            return self._run_message(state)
 
     def forward_backward(
         self,
@@ -312,24 +340,36 @@ class MegatronTrainingBackend:
         loss_fn_config: dict[str, float],
     ) -> ForwardBackwardResult:
         state = self._get_run(run_id)
-        batch = datums_to_tensor_batch(
-            data,
-            loss_fn=loss_fn,
-            device=self._config.tensor_device,
-        )
-        output = self._runtime.forward_backward(
-            handle=state.handle,
-            batch=batch,
-            loss_fn=loss_fn,
-            loss_fn_config=loss_fn_config,
-        )
-        state.gradient_version += 1
-        return ForwardBackwardResult(
-            run_id=run_id,
-            output=output,
-            gradient_version=state.gradient_version,
-            usage=Usage(input_tokens=batch.token_count),
-        )
+        with state.lock:
+            self._require_status(
+                state,
+                _RunStatus.READY,
+                operation="forward_backward",
+            )
+            batch = datums_to_tensor_batch(
+                data,
+                loss_fn=loss_fn,
+                device=self._config.tensor_device,
+            )
+            try:
+                output = self._runtime.forward_backward(
+                    handle=state.handle,
+                    batch=batch,
+                    loss_fn=loss_fn,
+                    loss_fn_config=loss_fn_config,
+                )
+            except Exception:
+                state.status = _RunStatus.FAILED
+                raise
+
+            state.gradient_version += 1
+            state.status = _RunStatus.GRADIENTS_PENDING
+            return ForwardBackwardResult(
+                run_id=run_id,
+                output=output,
+                gradient_version=state.gradient_version,
+                usage=Usage(input_tokens=batch.token_count),
+            )
 
     def optim_step(
         self,
@@ -341,47 +381,88 @@ class MegatronTrainingBackend:
         if params.learning_rate <= 0:
             raise InvalidRequestError("learning_rate must be positive")
 
-        self._runtime.optim_step(handle=state.handle, params=params)
-        state.optimizer_step += 1
-        state.checkpoint_version += 1
-        return OptimStepResult(
-            run_id=run_id,
-            optimizer_step=state.optimizer_step,
-            checkpoint_version=state.checkpoint_version,
-            usage=Usage(training_steps=1),
-        )
+        with state.lock:
+            self._require_status(
+                state,
+                _RunStatus.GRADIENTS_PENDING,
+                operation="optim_step",
+            )
+            try:
+                self._runtime.optim_step(handle=state.handle, params=params)
+            except Exception:
+                state.status = _RunStatus.FAILED
+                raise
+
+            state.optimizer_step += 1
+            state.checkpoint_version += 1
+            state.status = _RunStatus.READY
+            return OptimStepResult(
+                run_id=run_id,
+                optimizer_step=state.optimizer_step,
+                checkpoint_version=state.checkpoint_version,
+                usage=Usage(training_steps=1),
+            )
 
     def save_weights(self, *, run_id: str, kind: ArtifactKind) -> WeightArtifact:
         state = self._get_run(run_id)
-        runtime_payload = self._runtime.save_weights(
-            handle=state.handle,
-            run_id=run_id,
-            checkpoint_version=state.checkpoint_version,
-            kind=kind,
-        ) or {}
-        payload = {
-            "artifact_format": "megatron",
-            "backend": "megatron-bridge",
-            "base_model": state.base_model,
-            "checkpoint_version": state.checkpoint_version,
-            "gradient_version": state.gradient_version,
-            "global_batch_size": self._config.global_batch_size,
-            "lora_rank": state.lora_rank,
-            "micro_batch_size": self._config.micro_batch_size,
-            "optimizer_step": state.optimizer_step,
-            "pipeline_model_parallel_size": self._config.pipeline_model_parallel_size,
-            "run_id": state.run_id,
-            "sequence_length": self._config.sequence_length,
-            "tensor_model_parallel_size": self._config.tensor_model_parallel_size,
-            "tuning_mode": state.tuning_mode.name,
-        }
-        payload.update(runtime_payload)
-        return self._artifact_store.write(
-            run_id=state.run_id,
-            checkpoint_version=state.checkpoint_version,
-            kind=kind,
-            payload=payload,
-        )
+        with state.lock:
+            self._require_status(
+                state,
+                _RunStatus.READY,
+                operation="save_weights",
+            )
+            state.status = _RunStatus.CHECKPOINTING
+            try:
+                runtime_payload = self._runtime.save_weights(
+                    handle=state.handle,
+                    run_id=run_id,
+                    checkpoint_version=state.checkpoint_version,
+                    kind=kind,
+                ) or {}
+                payload = {
+                    "artifact_format": "megatron",
+                    "backend": "megatron-bridge",
+                    "base_model": state.base_model,
+                    "checkpoint_version": state.checkpoint_version,
+                    "gradient_version": state.gradient_version,
+                    "global_batch_size": self._config.global_batch_size,
+                    "lora_rank": state.lora_rank,
+                    "micro_batch_size": self._config.micro_batch_size,
+                    "optimizer_step": state.optimizer_step,
+                    "pipeline_model_parallel_size": self._config.pipeline_model_parallel_size,
+                    "run_id": state.run_id,
+                    "run_status": _RunStatus.READY.value,
+                    "sequence_length": self._config.sequence_length,
+                    "tensor_model_parallel_size": self._config.tensor_model_parallel_size,
+                    "tuning_mode": state.tuning_mode.name,
+                }
+                payload.update(runtime_payload)
+                artifact = self._artifact_store.write(
+                    run_id=state.run_id,
+                    checkpoint_version=state.checkpoint_version,
+                    kind=kind,
+                    payload=payload,
+                )
+            except Exception:
+                state.status = _RunStatus.READY
+                raise
+
+            state.status = _RunStatus.READY
+            return artifact
+
+    def close(self) -> None:
+        with self._lock:
+            states = list(self._runs.values())
+        for state in states:
+            with state.lock:
+                if state.status is _RunStatus.CLOSED:
+                    continue
+                try:
+                    self._runtime.shutdown(handle=state.handle)
+                except Exception:
+                    state.status = _RunStatus.FAILED
+                else:
+                    state.status = _RunStatus.CLOSED
 
     def _get_run(self, run_id: str) -> _RunState:
         if not run_id:
@@ -390,6 +471,32 @@ class MegatronTrainingBackend:
             return self._runs[run_id]
         except KeyError as exc:
             raise NotFoundError(f"unknown run_id={run_id}") from exc
+
+    def _ensure_no_active_run(self) -> None:
+        active = [
+            state.run_id
+            for state in self._runs.values()
+            if state.status not in (_RunStatus.FAILED, _RunStatus.CLOSED)
+        ]
+        if active:
+            raise InvalidRequestError(
+                "Megatron backend supports one active run per actor; "
+                f"active run_id={active[0]}"
+            )
+
+    def _require_status(
+        self,
+        state: _RunState,
+        expected: _RunStatus,
+        *,
+        operation: str,
+    ) -> None:
+        if state.status is expected:
+            return
+        raise InvalidRequestError(
+            f"cannot {operation} run_id={state.run_id} while run status is "
+            f"{state.status.value}; expected {expected.value}"
+        )
 
     def _run_message(self, state: _RunState) -> TrainingRun:
         return TrainingRun(

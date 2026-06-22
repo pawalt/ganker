@@ -134,6 +134,7 @@ class FakeMegatronRuntime:
         self.forwarded = []
         self.optimized = []
         self.saved = []
+        self.shutdowns = []
 
     def create_run(self, *, base_model, tuning_mode, lora_rank, config):
         self.created.append((base_model, tuning_mode, lora_rank, config))
@@ -150,11 +151,12 @@ class FakeMegatronRuntime:
         self.saved.append((handle, run_id, checkpoint_version, kind))
         return {"runtime": "fake-megatron", "checkpoint_path": f"/tmp/{run_id}"}
 
+    def shutdown(self, *, handle):
+        self.shutdowns.append(handle)
 
-def test_megatron_backend_lifecycle_with_mocked_runtime(tmp_path: Path):
-    pytest.importorskip("torch")
-    runtime = FakeMegatronRuntime()
-    backend = MegatronTrainingBackend(
+
+def _backend(tmp_path: Path, runtime: FakeMegatronRuntime) -> MegatronTrainingBackend:
+    return MegatronTrainingBackend(
         FilesystemArtifactStore(tmp_path),
         config=MegatronBackendConfig(
             tensor_model_parallel_size=1,
@@ -164,11 +166,40 @@ def test_megatron_backend_lifecycle_with_mocked_runtime(tmp_path: Path):
         runtime=runtime,
     )
 
-    run = backend.create_training_run(
+
+def _create_run(backend: MegatronTrainingBackend):
+    return backend.create_training_run(
         base_model="local/tiny-config",
         tuning_mode=TuningMode.LORA,
         lora_rank=4,
     )
+
+
+def _patch_tensor_batch(monkeypatch, token_count: int = 3):
+    class FakeTensorBatch:
+        def __init__(self, token_count: int):
+            self.token_count = token_count
+            self.input_ids = None
+            self.target_tokens = None
+            self.weights = None
+
+    def fake_datums_to_tensor_batch(data, *, loss_fn, device):
+        _ = loss_fn, device
+        return FakeTensorBatch(token_count)
+
+    monkeypatch.setitem(
+        MegatronTrainingBackend.forward_backward.__globals__,
+        "datums_to_tensor_batch",
+        fake_datums_to_tensor_batch,
+    )
+
+
+def test_megatron_backend_lifecycle_with_mocked_runtime(tmp_path: Path, monkeypatch):
+    _patch_tensor_batch(monkeypatch)
+    runtime = FakeMegatronRuntime()
+    backend = _backend(tmp_path, runtime)
+
+    run = _create_run(backend)
     fb = backend.forward_backward(
         run_id=run.run_id,
         data=[_datum([10, 11, 12])],
@@ -188,8 +219,153 @@ def test_megatron_backend_lifecycle_with_mocked_runtime(tmp_path: Path):
     assert step.optimizer_step == 1
     assert payload["artifact_format"] == "megatron"
     assert payload["backend"] == "megatron-bridge"
+    assert payload["run_status"] == "ready"
     assert payload["runtime"] == "fake-megatron"
     assert runtime.forwarded[0][1] == 3
     assert runtime.optimized[0][1] == 1e-4
     assert runtime.saved[0][2] == 1
 
+
+def test_megatron_backend_requires_forward_backward_before_optim_step(tmp_path: Path):
+    runtime = FakeMegatronRuntime()
+    backend = _backend(tmp_path, runtime)
+    run = _create_run(backend)
+
+    with pytest.raises(InvalidRequestError, match="gradients_pending"):
+        backend.optim_step(run_id=run.run_id, params=AdamParams(learning_rate=1e-4))
+
+    assert runtime.optimized == []
+
+
+def test_megatron_backend_rejects_second_forward_backward_before_step(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _patch_tensor_batch(monkeypatch)
+    runtime = FakeMegatronRuntime()
+    backend = _backend(tmp_path, runtime)
+    run = _create_run(backend)
+
+    backend.forward_backward(
+        run_id=run.run_id,
+        data=[_datum([10, 11, 12])],
+        loss_fn="cross_entropy",
+        loss_fn_config={},
+    )
+
+    with pytest.raises(InvalidRequestError, match="gradients_pending"):
+        backend.forward_backward(
+            run_id=run.run_id,
+            data=[_datum([10, 11, 12])],
+            loss_fn="cross_entropy",
+            loss_fn_config={},
+        )
+
+    assert len(runtime.forwarded) == 1
+
+
+def test_megatron_backend_rejects_save_while_gradients_are_pending(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _patch_tensor_batch(monkeypatch)
+    runtime = FakeMegatronRuntime()
+    backend = _backend(tmp_path, runtime)
+    run = _create_run(backend)
+
+    backend.forward_backward(
+        run_id=run.run_id,
+        data=[_datum([10, 11, 12])],
+        loss_fn="cross_entropy",
+        loss_fn_config={},
+    )
+
+    with pytest.raises(InvalidRequestError, match="gradients_pending"):
+        backend.save_weights(run_id=run.run_id, kind=ArtifactKind.DELTA)
+
+    assert runtime.saved == []
+
+
+def test_megatron_backend_marks_runtime_forward_failure_failed(tmp_path: Path, monkeypatch):
+    _patch_tensor_batch(monkeypatch)
+    class FailingForwardRuntime(FakeMegatronRuntime):
+        def forward_backward(self, *, handle, batch, loss_fn, loss_fn_config):
+            super().forward_backward(
+                handle=handle,
+                batch=batch,
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+            )
+            raise RuntimeError("forward exploded")
+
+    runtime = FailingForwardRuntime()
+    backend = _backend(tmp_path, runtime)
+    run = _create_run(backend)
+
+    with pytest.raises(RuntimeError, match="forward exploded"):
+        backend.forward_backward(
+            run_id=run.run_id,
+            data=[_datum([10, 11, 12])],
+            loss_fn="cross_entropy",
+            loss_fn_config={},
+        )
+
+    with pytest.raises(InvalidRequestError, match="failed"):
+        backend.save_weights(run_id=run.run_id, kind=ArtifactKind.DELTA)
+
+
+def test_megatron_backend_save_failure_leaves_run_ready_for_retry(tmp_path: Path):
+    class FlakySaveRuntime(FakeMegatronRuntime):
+        def __init__(self):
+            super().__init__()
+            self.fail_next_save = True
+
+        def save_weights(self, *, handle, run_id, checkpoint_version, kind):
+            if self.fail_next_save:
+                self.fail_next_save = False
+                raise RuntimeError("checkpoint exploded")
+            return super().save_weights(
+                handle=handle,
+                run_id=run_id,
+                checkpoint_version=checkpoint_version,
+                kind=kind,
+            )
+
+    runtime = FlakySaveRuntime()
+    backend = _backend(tmp_path, runtime)
+    run = _create_run(backend)
+
+    with pytest.raises(RuntimeError, match="checkpoint exploded"):
+        backend.save_weights(run_id=run.run_id, kind=ArtifactKind.DELTA)
+
+    artifact = backend.save_weights(run_id=run.run_id, kind=ArtifactKind.DELTA)
+
+    assert artifact.checkpoint_version == 0
+    assert len(runtime.saved) == 1
+
+
+def test_megatron_backend_allows_only_one_active_run(tmp_path: Path):
+    runtime = FakeMegatronRuntime()
+    backend = _backend(tmp_path, runtime)
+
+    run = _create_run(backend)
+    with pytest.raises(InvalidRequestError, match="one active run"):
+        _create_run(backend)
+
+    backend.close()
+    second_run = _create_run(backend)
+
+    assert run.run_id == "meg-run-000001"
+    assert second_run.run_id == "meg-run-000002"
+
+
+def test_megatron_backend_close_shuts_down_runtime_and_closes_run(tmp_path: Path):
+    runtime = FakeMegatronRuntime()
+    backend = _backend(tmp_path, runtime)
+    run = _create_run(backend)
+
+    backend.close()
+
+    assert len(runtime.shutdowns) == 1
+    with pytest.raises(InvalidRequestError, match="closed"):
+        backend.save_weights(run_id=run.run_id, kind=ArtifactKind.DELTA)

@@ -63,6 +63,10 @@ class TrainingActor(Actor):
     def save_weights(self, request: SaveWeightsRequest) -> SaveWeightsResponse:
         return self._component.save_weights(request)
 
+    @endpoint
+    def shutdown(self) -> None:
+        self._component.shutdown()
+
 
 class RolloutActor(Actor):
     """Owns rollout state and delegates sample calls to an inference backend."""
@@ -88,6 +92,10 @@ class RolloutActor(Actor):
     def sample(self, request: SampleRequest) -> SampleResponse:
         return self._component.sample(request)
 
+    @endpoint
+    def shutdown(self) -> None:
+        self._component.shutdown()
+
 
 class TelemetryActor(Actor):
     """Records general usage and event telemetry for local development."""
@@ -102,6 +110,10 @@ class TelemetryActor(Actor):
     @endpoint
     def get_summary(self, request: GetTelemetrySummaryRequest) -> GetTelemetrySummaryResponse:
         return self._component.get_summary(request)
+
+    @endpoint
+    def shutdown(self) -> None:
+        return None
 
 
 class ProxyActor(Actor):
@@ -148,6 +160,10 @@ class ProxyActor(Actor):
         request: GetTelemetrySummaryRequest,
     ) -> GetTelemetrySummaryResponse:
         return await self._telemetry.get_summary.choose(request)
+
+    @endpoint
+    async def shutdown(self) -> None:
+        return None
 
     async def _record_usage(self, request_id: str, run_id: str, event_source: str, usage):
         if not usage.has_activity():

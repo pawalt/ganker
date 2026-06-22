@@ -32,6 +32,8 @@ uv run pytest
 - Production inference is expected to use `sglang` behind `InferenceBackend`.
 - Local development and tests must keep working without Megatron, `sglang`, CUDA, model weights, or checkpoints.
 - Heavy backend imports must stay isolated in their adapter modules.
+- The Megatron backend owns a stateful runtime lifecycle: one active run per actor, `forward_backward` moves to pending gradients, `optim_step` consumes pending gradients, and `save_weights` is allowed only from ready state.
+- Test Megatron lifecycle behavior with injected runtimes; do not require real Megatron imports for lifecycle unit tests.
 
 ## Testing Expectations
 

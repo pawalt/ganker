@@ -23,6 +23,8 @@ class LocalMonarchMesh:
     proxy: Any
 
     def stop(self) -> None:
+        for actor in (self.training, self.rollout, self.telemetry, self.proxy):
+            actor.shutdown.choose().get(timeout=10)
         for actor in (self.proxy, self.training, self.rollout, self.telemetry):
             actor.stop().get(timeout=10)
         self.procs.stop().get(timeout=10)

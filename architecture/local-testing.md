@@ -59,14 +59,22 @@ This keeps component behavior easy to test without Monarch while still verifying
 
 ## Shutdown
 
-`LocalMonarchMesh.stop()` stops the spawned actors and process mesh:
+`LocalMonarchMesh.stop()` first calls explicit actor shutdown endpoints, then stops the spawned actors and process mesh:
 
 ```text
+TrainingActor.shutdown()  -> TrainingComponent.shutdown() -> backend.close()
+RolloutActor.shutdown()   -> RolloutComponent.shutdown()  -> backend.close() if present
+TelemetryActor.shutdown()
+ProxyActor.shutdown()
+
 ProxyActor.stop()
 TrainingActor.stop()
 RolloutActor.stop()
 TelemetryActor.stop()
 ProcMesh.stop()
 ```
+
+This gives stateful backends, including the Megatron runtime adapter, a chance
+to flush or release runtime handles before Monarch tears down the process mesh.
 
 The harness does not call `this_host().shutdown()` because `this_host()` returns a reference to the current host, not an owned host allocation.
