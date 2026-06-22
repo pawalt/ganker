@@ -74,6 +74,16 @@ The real SGLang adapter can either attach to an existing SGLang HTTP endpoint
 with `SGLangBackendConfig(base_url=...)` or launch
 `python -m sglang.launch_server` with `launch_server=True`.
 
+Real SGLang execution is tested on Modal with a GPU:
+
+```bash
+source ~/.codex/modal.env
+modal run modal_apps/sglang_smoke.py --mode client
+```
+
+That smoke starts SGLang for `Qwen/Qwen3-0.6B`, then samples through
+`ServiceClient.local(..., inference_backend="sglang")`.
+
 Megatron adapter preflight tests run locally without a GPU:
 
 ```bash

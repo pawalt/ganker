@@ -71,3 +71,15 @@ def test_sft_modal_app_compiles():
         ],
         check=True,
     )
+
+
+def test_sglang_modal_app_compiles():
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            "modal_apps/sglang_smoke.py",
+        ],
+        check=True,
+    )

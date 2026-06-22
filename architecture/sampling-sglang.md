@@ -106,3 +106,27 @@ uv run pytest tests/test_sglang_backend.py
 
 This keeps the default suite CPU-only while still testing the contracts that a
 real SGLang server will see on Modal.
+
+## GPU Smoke
+
+The real GPU smoke lives in `modal_apps/sglang_smoke.py`:
+
+```bash
+source ~/.codex/modal.env
+modal run modal_apps/sglang_smoke.py --mode client
+```
+
+`--mode client` exercises:
+
+```text
+ServiceClient.local(...)
+  -> Monarch ProxyActor
+  -> RolloutActor
+  -> SGLangInferenceBackend
+  -> python -m sglang.launch_server
+  -> /generate
+```
+
+`--mode backend` skips Monarch and calls `SGLangInferenceBackend` directly. It
+is useful for isolating SGLang server or payload issues from actor
+orchestration issues.

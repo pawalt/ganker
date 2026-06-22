@@ -50,6 +50,7 @@ uv run pytest
 - Remote mesh smoke tests live in `modal_apps/remote_mesh.py`. Use `modal run modal_apps/remote_mesh.py --mode grpc-smoke-fake` for fake backends, `--mode grpc-smoke-qwen-lora` for Bridge/GPU, and `--mode serve` for a singleton gRPC server behind a Modal tunnel.
 - Modal smoke implementation lives in `tests/modal_smoke/` as importable test helpers. `scripts/megatron_bridge_smoke.py` is only a compatibility CLI wrapper, and `modal_apps/megatron_smoke.py` should call the importable helpers directly.
 - SGLang backend tests live in `tests/test_sglang_backend.py`; run them with `uv run pytest tests/test_sglang_backend.py` and do not require SGLang, CUDA, or model downloads.
+- Real SGLang execution smoke tests should run through Modal/GPU infrastructure. Use `source ~/.codex/modal.env` and `modal run modal_apps/sglang_smoke.py --mode client`.
 - Keep tests lightweight enough to run with `uv run pytest` on a CPU-only development machine.
 
 ## gRPC Codegen
