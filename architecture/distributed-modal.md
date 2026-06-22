@@ -1,8 +1,8 @@
 # Modal Distributed Orchestration
 
-This document describes the current distributed smoke path. It is still a fake
-trainer/fake rollout implementation, but it uses the same Monarch
-`attach_to_workers` pattern intended for real Modal deployment.
+This document describes the current distributed smoke paths. The cheap modes use
+fake backends, and the GPU modes use the same Monarch `attach_to_workers`
+pattern with Megatron Bridge training and optional SGLang rollout inference.
 
 ## Shape
 
@@ -32,7 +32,7 @@ external client
     |                              |
     v                              v
 TrainingActor                 RolloutActor
-Megatron backend later         SGLang HTTP backend later
+Fake or Megatron backend       Fake or SGLang HTTP backend
     |                              ^
     v                              |
 Modal Volume: /vol/ganker-artifacts+
@@ -83,14 +83,20 @@ trainer save_weights
   -> write /vol/ganker-artifacts/weights/...
   -> artifact_volume.commit()
 
-rollout refresh/sample
+rollout refresh_weights
   -> artifact_volume.reload()
   -> read or accept /vol/ganker-artifacts/weights/...
+
+rollout sample
+  -> use already-loaded artifact state
 ```
 
 The current Modal smoke uses `ganker-distributed-artifacts` mounted at
 `/vol/ganker-artifacts`. This mirrors the later Megatron-to-SGLang path where
 the trainer exports a checkpoint or adapter and the rollout service reloads it.
+Reload happens before `refresh_weights`, not before every `sample`, because an
+SGLang process can keep adapter files open after loading them and Modal rejects
+Volume reloads while files are open.
 
 ## Placement
 
@@ -150,6 +156,23 @@ GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed_mesh.py \
   --micro-batch-size 1
 ```
 
+Real Qwen3 0.6B LoRA SFT through Megatron Bridge plus SGLang rollout:
+
+```bash
+source ~/.codex/modal.env
+GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed_mesh.py \
+  --mode qwen-bridge-sglang-distributed \
+  --port 26600 \
+  --controller-port 26610 \
+  --startup-timeout 900 \
+  --sglang-startup-timeout 900 \
+  --tuning lora \
+  --lora-rank 8 \
+  --max-steps 1 \
+  --sequence-length 32 \
+  --micro-batch-size 1
+```
+
 The `fake-distributed` smoke verifies:
 
 ```text
@@ -187,4 +210,20 @@ controller function, Bridge image, CPU
   -> forward_backward + optim_step
   -> export hf-lora-adapter safetensors to Modal Volume
   -> rollout refresh + sample through SamplingClient
+```
+
+The `qwen-bridge-sglang-distributed` smoke keeps that trainer path and replaces
+the fake rollout worker with a GPU Modal function running the SGLang image:
+
+```text
+controller function, Bridge image, CPU
+  -> attach trainer worker, Bridge image, GPU
+  -> attach rollout worker, SGLang image, GPU
+  -> HFAutoTokenizerAdapter(Qwen/Qwen3-0.6B)
+  -> TrainingActor(training_backend="megatron", runtime_kind="bridge")
+  -> export hf-lora-adapter safetensors to Modal Volume
+  -> RolloutActor(inference_backend="sglang")
+  -> launch python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B
+  -> load /vol/ganker-artifacts/.../adapter_model.safetensors
+  -> sample text through SamplingClient.sample_text(...)
 ```
