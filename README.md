@@ -104,12 +104,15 @@ Distributed Modal orchestration has two CPU-only smokes:
 source ~/.codex/modal.env
 uv run modal run modal_apps/distributed_mesh.py --mode tcp-smoke --port 26620
 uv run modal run modal_apps/distributed_mesh.py --mode fake-distributed --port 26600 --controller-port 26610
+uv run modal run modal_apps/distributed_mesh.py --mode sft-distributed --port 26600 --controller-port 26610
 ```
 
 The first verifies private i6pn TCP between Modal functions. The second verifies
 Monarch `attach_to_workers` over i6pn with separate trainer and rollout worker
-containers. All i6pn roles must be pinned to the same exact region, currently
-`us-east-1`.
+containers. The third runs a full toy SFT loop through the distributed
+controller path, saves weights to a shared Modal Volume, refreshes rollout, and
+samples from the saved artifact. All i6pn roles must be pinned to the same
+exact region, currently `us-east-1`.
 
 Megatron adapter preflight tests run locally without a GPU:
 

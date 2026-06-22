@@ -16,10 +16,21 @@ import socket
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Literal, cast
 import uuid
 
 import modal
+from monarch.actor import endpoint
+
+from ganker.actors import RolloutActor, TrainingActor
+from ganker.contracts import (
+    RefreshWeightsRequest,
+    RefreshWeightsResponse,
+    SampleRequest,
+    SampleResponse,
+    SaveWeightsRequest,
+    SaveWeightsResponse,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +38,9 @@ REMOTE_ROOT = Path("/workspace/ganker")
 PYTHON_VERSION = os.getenv("GANKER_MODAL_PYTHON", "3.12")
 REGION = os.getenv("GANKER_MODAL_REGION", "us-east-1")
 REGISTRY_NAME = os.getenv("GANKER_DISTRIBUTED_REGISTRY", "ganker-distributed-registry")
+ARTIFACT_VOLUME_NAME = os.getenv("GANKER_DISTRIBUTED_ARTIFACT_VOLUME", "ganker-distributed-artifacts")
+ARTIFACT_VOLUME_ROOT = Path(os.getenv("GANKER_DISTRIBUTED_ARTIFACT_ROOT", "/vol/ganker-artifacts"))
+ARTIFACT_VOLUME_MOUNT = str(ARTIFACT_VOLUME_ROOT)
 MONARCH_PORT = int(os.getenv("GANKER_DISTRIBUTED_MONARCH_PORT", "26600"))
 CONTROLLER_PORT = int(os.getenv("GANKER_DISTRIBUTED_CONTROLLER_PORT", "26610"))
 TCP_SMOKE_PORT = int(os.getenv("GANKER_DISTRIBUTED_TCP_SMOKE_PORT", "26620"))
@@ -65,6 +79,31 @@ def _base_image():
 image = _base_image()
 app = modal.App("ganker-distributed-mesh")
 registry = modal.Dict.from_name(REGISTRY_NAME, create_if_missing=True)
+artifact_volume = modal.Volume.from_name(ARTIFACT_VOLUME_NAME, create_if_missing=True)
+
+
+class ModalVolumeTrainingActor(TrainingActor):
+    """Training actor that commits Modal Volume writes after saving weights."""
+
+    @endpoint
+    def save_weights(self, request: SaveWeightsRequest) -> SaveWeightsResponse:
+        response = self._component.save_weights(request)
+        artifact_volume.commit()
+        return response
+
+
+class ModalVolumeRolloutActor(RolloutActor):
+    """Rollout actor that reloads Modal Volume state before artifact reads."""
+
+    @endpoint
+    def refresh_weights(self, request: RefreshWeightsRequest) -> RefreshWeightsResponse:
+        artifact_volume.reload()
+        return self._component.refresh_weights(request)
+
+    @endpoint
+    def sample(self, request: SampleRequest) -> SampleResponse:
+        artifact_volume.reload()
+        return self._component.sample(request)
 
 
 def _add_remote_import_paths() -> None:
@@ -139,7 +178,13 @@ def _wait_for_endpoint(
     raise TimeoutError(f"timed out waiting for {key}")
 
 
-@app.function(image=image, timeout=60 * 60, i6pn=True, region=REGION)
+@app.function(
+    image=image,
+    timeout=60 * 60,
+    i6pn=True,
+    region=REGION,
+    volumes={ARTIFACT_VOLUME_MOUNT: artifact_volume},
+)
 def monarch_worker_role(
     deployment_id: str,
     run_id: str,
@@ -200,8 +245,8 @@ def monarch_worker_role(
                 proc.wait(timeout=10)
 
 
-@app.function(image=image, timeout=60 * 60, i6pn=True, region=REGION)
-def run_fake_distributed(
+def _start_fake_distributed_runtime(
+    *,
     deployment_id: str,
     run_id: str,
     artifact_root: str,
@@ -211,36 +256,28 @@ def run_fake_distributed(
 ) -> dict[str, Any]:
     _add_remote_import_paths()
 
-    from ganker.actors import ControllerActor, ControllerProxyActor, RolloutActor, TelemetryActor, TrainingActor
-    from ganker.contracts import (
-        AdamParams,
-        CreateTrainingRunRequest,
-        Datum,
-        ForwardBackwardRequest,
-        ModelInput,
-        OptimStepRequest,
-        RequestContext,
-        TensorData,
-        TuningMode,
-    )
+    from ganker.actors import ControllerActor, ControllerProxyActor, TelemetryActor
     from ganker.distributed.monarch import attach_role_endpoints
     from ganker.distributed.registry import RoleEndpoint
     from monarch.actor import enable_transport, this_host
 
-    trainer_call = None
-    rollout_call = None
-    trainer_hosts = None
-    rollout_hosts = None
-    controller_procs = None
-    trainer_procs = None
-    rollout_procs = None
+    runtime: dict[str, Any] = {
+        "trainer_call": None,
+        "rollout_call": None,
+        "trainer_hosts": None,
+        "rollout_hosts": None,
+        "controller_procs": None,
+        "trainer_procs": None,
+        "rollout_procs": None,
+    }
     try:
         controller_host = _i6pn_address()
         controller_transport = f"tcp://[{controller_host}]:{controller_port}"
         enable_transport(controller_transport)
+        runtime["controller_transport"] = controller_transport
 
-        trainer_call = monarch_worker_role.spawn(deployment_id, run_id, "trainer", 0, port)
-        rollout_call = monarch_worker_role.spawn(deployment_id, run_id, "rollout", 0, port)
+        runtime["trainer_call"] = monarch_worker_role.spawn(deployment_id, run_id, "trainer", 0, port)
+        runtime["rollout_call"] = monarch_worker_role.spawn(deployment_id, run_id, "rollout", 0, port)
 
         trainer_endpoint = RoleEndpoint.from_dict(
             _wait_for_endpoint(
@@ -260,31 +297,110 @@ def run_fake_distributed(
                 timeout_seconds=startup_timeout,
             )
         )
+        runtime["trainer_endpoint"] = trainer_endpoint
+        runtime["rollout_endpoint"] = rollout_endpoint
 
-        trainer_hosts = attach_role_endpoints(
+        runtime["trainer_hosts"] = attach_role_endpoints(
             [trainer_endpoint],
             name=f"{deployment_id}_trainer",
             family="ipv6",
             transport=None,
         )
-        rollout_hosts = attach_role_endpoints(
+        runtime["rollout_hosts"] = attach_role_endpoints(
             [rollout_endpoint],
             name=f"{deployment_id}_rollout",
             family="ipv6",
             transport=None,
         )
-        controller_procs = this_host().spawn_procs(name=f"{deployment_id}_controller")
-        trainer_procs = trainer_hosts.spawn_procs(name=f"{deployment_id}_trainer")
-        rollout_procs = rollout_hosts.spawn_procs(name=f"{deployment_id}_rollout")
+        runtime["controller_procs"] = this_host().spawn_procs(name=f"{deployment_id}_controller")
+        runtime["trainer_procs"] = runtime["trainer_hosts"].spawn_procs(name=f"{deployment_id}_trainer")
+        runtime["rollout_procs"] = runtime["rollout_hosts"].spawn_procs(name=f"{deployment_id}_rollout")
 
-        training = trainer_procs.spawn("training", TrainingActor, artifact_root, "fake", None)
-        rollout = rollout_procs.spawn("rollout", RolloutActor, artifact_root, "fake", None)
-        telemetry = controller_procs.spawn("telemetry", TelemetryActor)
-        controller = controller_procs.spawn("controller", ControllerActor, training, rollout, telemetry)
-        proxy = controller_procs.spawn("proxy", ControllerProxyActor, controller)
+        training = runtime["trainer_procs"].spawn("training", ModalVolumeTrainingActor, artifact_root, "fake", None)
+        rollout = runtime["rollout_procs"].spawn("rollout", ModalVolumeRolloutActor, artifact_root, "fake", None)
+        telemetry = runtime["controller_procs"].spawn("telemetry", TelemetryActor)
+        controller = runtime["controller_procs"].spawn("controller", ControllerActor, training, rollout, telemetry)
+        proxy = runtime["controller_procs"].spawn("proxy", ControllerProxyActor, controller)
         for actor in (training, rollout, telemetry, controller, proxy):
             actor.initialized.get(timeout=30)
 
+        runtime.update(
+            {
+                "training": training,
+                "rollout": rollout,
+                "telemetry": telemetry,
+                "controller": controller,
+                "proxy": proxy,
+            }
+        )
+        return runtime
+    except Exception:
+        _stop_fake_distributed_runtime(runtime)
+        raise
+
+
+def _stop_fake_distributed_runtime(runtime: dict[str, Any] | None) -> None:
+    if runtime is None:
+        return
+    for mesh in (runtime.get("trainer_procs"), runtime.get("rollout_procs"), runtime.get("controller_procs")):
+        if mesh is not None:
+            try:
+                mesh.stop().get(timeout=10)
+            except Exception as exc:
+                print(f"[cleanup] proc mesh stop failed: {exc}", flush=True)
+    for mesh in (runtime.get("trainer_hosts"), runtime.get("rollout_hosts")):
+        if mesh is not None:
+            try:
+                mesh.stop().get(timeout=10)
+            except Exception as exc:
+                print(f"[cleanup] host mesh stop failed: {exc}", flush=True)
+    for call in (runtime.get("trainer_call"), runtime.get("rollout_call")):
+        if call is not None:
+            call.cancel(terminate_containers=True)
+
+
+@app.function(
+    image=image,
+    timeout=60 * 60,
+    i6pn=True,
+    region=REGION,
+    volumes={ARTIFACT_VOLUME_MOUNT: artifact_volume},
+)
+def run_fake_distributed(
+    deployment_id: str,
+    run_id: str,
+    artifact_root: str,
+    port: int,
+    controller_port: int,
+    startup_timeout: int,
+) -> dict[str, Any]:
+    _add_remote_import_paths()
+
+    from ganker.contracts import (
+        AdamParams,
+        CreateTrainingRunRequest,
+        Datum,
+        ForwardBackwardRequest,
+        ModelInput,
+        OptimStepRequest,
+        RequestContext,
+        TensorData,
+        TuningMode,
+    )
+
+    runtime = None
+    try:
+        runtime = _start_fake_distributed_runtime(
+            deployment_id=deployment_id,
+            run_id=run_id,
+            artifact_root=artifact_root,
+            port=port,
+            controller_port=controller_port,
+            startup_timeout=startup_timeout,
+        )
+        proxy = runtime["proxy"]
+        trainer_endpoint = runtime["trainer_endpoint"]
+        rollout_endpoint = runtime["rollout_endpoint"]
         created = proxy.create_training_run.choose(
             CreateTrainingRunRequest(
                 context=RequestContext("modal-distributed-create"),
@@ -323,7 +439,7 @@ def run_fake_distributed(
                 "deployment_id": deployment_id,
                 "run_id": created.run.run_id,
                 "region": REGION,
-                "controller_transport": controller_transport,
+                "controller_transport": runtime["controller_transport"],
                 "trainer_target": trainer_endpoint.target(family="ipv6"),
                 "rollout_target": rollout_endpoint.target(family="ipv6"),
                 "loss": fb.loss,
@@ -332,22 +448,149 @@ def run_fake_distributed(
             }
         )
     finally:
-        for mesh in (trainer_procs, rollout_procs, controller_procs):
-            if mesh is not None:
-                try:
-                    mesh.stop().get(timeout=10)
-                except Exception as exc:
-                    print(f"[cleanup] proc mesh stop failed: {exc}", flush=True)
-        for mesh in (trainer_hosts, rollout_hosts):
-            if mesh is not None:
-                try:
-                    mesh.stop().get(timeout=10)
-                except Exception as exc:
-                    print(f"[cleanup] host mesh stop failed: {exc}", flush=True)
-        if trainer_call is not None:
-            trainer_call.cancel(terminate_containers=True)
-        if rollout_call is not None:
-            rollout_call.cancel(terminate_containers=True)
+        _stop_fake_distributed_runtime(runtime)
+
+
+@app.function(
+    image=image,
+    timeout=60 * 60,
+    i6pn=True,
+    region=REGION,
+    volumes={ARTIFACT_VOLUME_MOUNT: artifact_volume},
+)
+def run_distributed_sft(
+    deployment_id: str,
+    run_id: str,
+    artifact_root: str,
+    port: int,
+    controller_port: int,
+    startup_timeout: int,
+    dataset_path: str,
+    base_model: str,
+    tuning: str,
+    lora_rank: int,
+    max_steps: int,
+    save_every: int,
+    learning_rate: float,
+    sequence_length: int,
+    micro_batch_size: int,
+    vocab_size: int,
+    seed: int,
+) -> dict[str, Any]:
+    _add_remote_import_paths()
+    if tuning not in {"full", "lora"}:
+        raise ValueError("tuning must be 'full' or 'lora'")
+    if tuning == "lora" and lora_rank <= 0:
+        raise ValueError("lora_rank must be positive for LoRA")
+    tuning_literal = cast(Literal["full", "lora"], tuning)
+
+    from examples.sft import SFTDataConfig, ToyTokenizer, load_jsonl_sft_batches, run_sft
+    from ganker.client import SamplingClient, ServiceClient, TrainingClient
+    from ganker.contracts import (
+        ArtifactKind,
+        ModelInput,
+        SamplingParams,
+        TrainingRun,
+        TuningMode,
+        WeightArtifact,
+    )
+    from ganker.transport import MonarchProxyTransport
+
+    tokenizer = ToyTokenizer(vocab_size=vocab_size)
+    batches = load_jsonl_sft_batches(
+        dataset_path,
+        tokenizer=tokenizer,
+        config=SFTDataConfig(
+            sequence_length=sequence_length,
+            batch_size=micro_batch_size,
+            shuffle=True,
+            seed=seed,
+        ),
+    )
+
+    runtime = None
+    client = None
+    try:
+        runtime = _start_fake_distributed_runtime(
+            deployment_id=deployment_id,
+            run_id=run_id,
+            artifact_root=artifact_root,
+            port=port,
+            controller_port=controller_port,
+            startup_timeout=startup_timeout,
+        )
+        client = ServiceClient(
+            _transport=MonarchProxyTransport(runtime["proxy"], timeout=60),
+        )
+        summary = run_sft(
+            client,
+            base_model=base_model,
+            dataset=batches,
+            tuning=tuning_literal,
+            lora_rank=lora_rank if tuning == "lora" else 0,
+            learning_rate=learning_rate,
+            max_steps=max_steps,
+            save_every=save_every,
+        )
+
+        artifact_kind = ArtifactKind.DELTA if tuning == "lora" else ArtifactKind.FULL
+        tuning_mode = TuningMode.LORA if tuning == "lora" else TuningMode.FULL
+        artifact = WeightArtifact(
+            run_id=summary.run_id,
+            checkpoint_version=summary.checkpoint_version,
+            kind=artifact_kind,
+            manifest_path=summary.manifest_path,
+            payload_path=summary.artifact_path,
+        )
+        training_run = TrainingRun(
+            run_id=summary.run_id,
+            base_model=base_model,
+            tuning_mode=tuning_mode,
+            lora_rank=lora_rank if tuning == "lora" else 0,
+            checkpoint_version=summary.checkpoint_version,
+        )
+        training = TrainingClient(service=client, run=training_run)
+        refreshed = training.refresh_weights(
+            artifact,
+            request_id="modal-distributed-sft-refresh",
+        )
+        sampler = SamplingClient(service=client, run=training_run, artifact=refreshed.artifact)
+        sample = sampler.sample(
+            ModelInput.from_ints([7, 8]),
+            SamplingParams(max_tokens=4, temperature=0.7, top_p=0.9),
+            request_id="modal-distributed-sft-sample",
+        )
+        telemetry = sampler.get_telemetry_summary(
+            request_id="modal-distributed-sft-telemetry",
+        )
+        artifact_volume.reload()
+
+        payload = {
+            "ok": True,
+            "mode": "sft-distributed",
+            "deployment_id": deployment_id,
+            "region": REGION,
+            "controller_transport": runtime["controller_transport"],
+            "trainer_target": runtime["trainer_endpoint"].target(family="ipv6"),
+            "rollout_target": runtime["rollout_endpoint"].target(family="ipv6"),
+            "dataset_path": dataset_path,
+            "batch_count": len(batches),
+            "sample_tokens": sample.sequences[0].tokens,
+            "sample_checkpoint_version": sample.artifact.checkpoint_version,
+            "telemetry_events": telemetry.summary.event_count,
+            "telemetry_input_tokens": telemetry.summary.total.input_tokens,
+            "telemetry_output_tokens": telemetry.summary.total.output_tokens,
+            "telemetry_training_steps": telemetry.summary.total.training_steps,
+            "telemetry_samples": telemetry.summary.total.samples,
+            **summary.to_dict(),
+        }
+        payload["artifact_exists"] = Path(summary.artifact_path).exists()
+        payload["manifest_exists"] = Path(summary.manifest_path).exists()
+        return _json_safe(payload)
+    finally:
+        if client is not None:
+            client.close()
+        _stop_fake_distributed_runtime(runtime)
 
 
 @app.function(image=image, timeout=10 * 60, i6pn=True, region=REGION)
@@ -418,18 +661,49 @@ def run_tcp_smoke(
 @app.local_entrypoint()
 def main(
     mode: str = "fake-distributed",
-    artifact_root: str = "/tmp/ganker-distributed-artifacts",
+    dataset_path: str = str(REMOTE_ROOT / "examples" / "tiny_sft.jsonl"),
+    artifact_root: str = str(ARTIFACT_VOLUME_ROOT),
+    base_model: str = "local/tiny-sft",
+    tuning: str = "lora",
+    lora_rank: int = 8,
+    max_steps: int = 4,
+    save_every: int = 2,
+    learning_rate: float = 1e-4,
+    sequence_length: int = 64,
+    micro_batch_size: int = 1,
+    vocab_size: int = 128,
+    seed: int = 1234,
     port: int = MONARCH_PORT,
     controller_port: int = CONTROLLER_PORT,
     startup_timeout: int = 120,
     deployment_id: str = "",
     run_id: str = "run-000001",
 ):
-    if mode not in {"fake-distributed", "tcp-smoke"}:
+    if mode not in {"fake-distributed", "sft-distributed", "tcp-smoke"}:
         raise ValueError(f"unknown mode: {mode}")
     deployment = deployment_id or f"dev-{uuid.uuid4().hex[:8]}"
     if mode == "tcp-smoke":
         result = run_tcp_smoke.remote(deployment, run_id, port or TCP_SMOKE_PORT, startup_timeout)
+    elif mode == "sft-distributed":
+        result = run_distributed_sft.remote(
+            deployment,
+            run_id,
+            artifact_root,
+            port,
+            controller_port,
+            startup_timeout,
+            dataset_path,
+            base_model,
+            tuning,
+            lora_rank,
+            max_steps,
+            save_every,
+            learning_rate,
+            sequence_length,
+            micro_batch_size,
+            vocab_size,
+            seed,
+        )
     else:
         result = run_fake_distributed.remote(
             deployment,

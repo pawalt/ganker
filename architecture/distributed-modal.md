@@ -33,6 +33,9 @@ external client
     v                              v
 TrainingActor                 RolloutActor
 Megatron backend later         SGLang HTTP backend later
+    |                              ^
+    v                              |
+Modal Volume: /vol/ganker-artifacts+
 ```
 
 The external client should not speak Monarch. Internal Modal roles should not
@@ -69,6 +72,26 @@ configuration to remote host agents, so workers need a controller address they
 can reach over i6pn. Modal container hostnames such as `modal` or `localhost`
 are not sufficient for cross-container Monarch attach.
 
+## Artifacts
+
+Distributed SFT cannot use container-local `/tmp` artifacts. Trainer and
+rollout run in separate Modal containers, so saved weights must live on a
+shared Volume mounted at the same path in all roles:
+
+```text
+trainer save_weights
+  -> write /vol/ganker-artifacts/weights/...
+  -> artifact_volume.commit()
+
+rollout refresh/sample
+  -> artifact_volume.reload()
+  -> read or accept /vol/ganker-artifacts/weights/...
+```
+
+The current Modal smoke uses `ganker-distributed-artifacts` mounted at
+`/vol/ganker-artifacts`. This mirrors the later Megatron-to-SGLang path where
+the trainer exports a checkpoint or adapter and the rollout service reloads it.
+
 ## Placement
 
 All roles that communicate over i6pn must use:
@@ -101,6 +124,16 @@ uv run modal run modal_apps/distributed_mesh.py \
   --controller-port 26610
 ```
 
+Full toy SFT job through the distributed topology:
+
+```bash
+source ~/.codex/modal.env
+uv run modal run modal_apps/distributed_mesh.py \
+  --mode sft-distributed \
+  --port 26600 \
+  --controller-port 26610
+```
+
 The `fake-distributed` smoke verifies:
 
 ```text
@@ -111,4 +144,15 @@ Modal controller function
   -> ControllerActor
   -> TrainingActor on trainer worker
   -> RolloutActor on rollout worker
+```
+
+The `sft-distributed` smoke additionally verifies:
+
+```text
+examples.sft.run_sft(...)
+  -> 4 toy SFT steps
+  -> save LoRA artifact on Modal Volume
+  -> rollout refresh from saved artifact
+  -> sample through SamplingClient
+  -> telemetry records trainer and rollout usage
 ```

@@ -55,6 +55,7 @@ uv run pytest
 - Distributed Modal roles that communicate over i6pn must all use `i6pn=True` and the same exact Modal region, such as `region="us-east-1"`. Do not use broad/meta regions such as `us-east` for i6pn-connected controller, proxy, trainer, or inference roles.
 - Distributed Monarch attach across Modal containers needs a reachable controller transport too. Call `enable_transport("tcp://[controller-i6pn]:port")` before any other Monarch API in the controller container, then `attach_to_workers(...)` against worker endpoints like `tcp://[worker-i6pn]:26600`.
 - Distributed Modal smoke tests live in `modal_apps/distributed_mesh.py`. Use `source ~/.codex/modal.env` and `uv run modal run modal_apps/distributed_mesh.py --mode tcp-smoke --port 26620` to verify private i6pn TCP, then `uv run modal run modal_apps/distributed_mesh.py --mode fake-distributed --port 26600 --controller-port 26610` to verify Monarch `attach_to_workers`.
+- Full distributed SFT smoke runs with `uv run modal run modal_apps/distributed_mesh.py --mode sft-distributed --port 26600 --controller-port 26610`. It uses a Modal Volume mounted at `/vol/ganker-artifacts`; trainer actors must commit after `save_weights`, and rollout/controller code must reload before reading saved artifacts.
 - Keep tests lightweight enough to run with `uv run pytest` on a CPU-only development machine.
 
 ## gRPC Codegen
