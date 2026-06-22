@@ -13,6 +13,7 @@ from examples.sft.data import (
     load_jsonl_examples,
     load_jsonl_sft_batches,
 )
+from examples.sft.real_data import alpaca_record_to_sft_example, write_sft_jsonl
 
 
 class FixedTokenizer:
@@ -119,3 +120,42 @@ def test_load_jsonl_sft_batches_uses_toy_tokenizer_and_fixed_lengths(tmp_path: P
 def test_batch_datums_rejects_empty_iterable():
     with pytest.raises(ValueError, match="no SFT datums"):
         batch_datums([], batch_size=1)
+
+
+def test_alpaca_record_to_sft_example_formats_instruction_input_and_response():
+    example = alpaca_record_to_sft_example(
+        {
+            "instruction": "Classify the sentiment.",
+            "input": "I liked the movie.",
+            "output": "Positive",
+        }
+    )
+
+    assert "### Instruction:\nClassify the sentiment." in example.prompt
+    assert "### Input:\nI liked the movie." in example.prompt
+    assert example.prompt.endswith("### Response:\n")
+    assert example.completion == "Positive"
+    assert example.metadata == {"dataset_format": "alpaca"}
+
+
+def test_write_sft_jsonl_round_trips_through_existing_loader(tmp_path: Path):
+    path = tmp_path / "alpaca.jsonl"
+
+    count = write_sft_jsonl(
+        [
+            SFTExample(
+                prompt="Prompt",
+                completion="Completion",
+                weight=0.5,
+                metadata={"source": "test"},
+            )
+        ],
+        path,
+    )
+
+    assert count == 1
+    [loaded] = load_jsonl_examples(path)
+    assert loaded.prompt == "Prompt"
+    assert loaded.completion == "Completion"
+    assert loaded.weight == 0.5
+    assert loaded.metadata == {"source": "test"}

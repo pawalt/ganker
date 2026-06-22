@@ -143,3 +143,15 @@ def test_qwen_sft_modal_example_compiles():
         ],
         check=True,
     )
+
+
+def test_qwen_sft_hf_comparison_example_compiles():
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            "modal_apps/qwen_sft/compare_hf.py",
+        ],
+        check=True,
+    )

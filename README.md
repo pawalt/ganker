@@ -112,6 +112,25 @@ trainer plus SGLang rollout shape. `modal_apps/qwen_sft/sft.py` is the
 Tinker-style example: create batches, call `TrainingClient`, save weights,
 refresh rollout, and sample through `SamplingClient`.
 
+The longer real-data validation path compares the Megatron Bridge/Ganker loss
+curve against a Hugging Face Trainer + PEFT LoRA baseline on the same
+materialized Alpaca-style JSONL file:
+
+```bash
+source ~/.codex/modal.env
+GANKER_MODAL_GPU=A100 uv run modal run modal_apps/qwen_sft/compare_hf.py \
+  --startup-timeout 900 \
+  --dataset-size 256 \
+  --max-steps 20 \
+  --sequence-length 256
+```
+
+`compare_hf.py` writes `tatsu-lab/alpaca` examples into the Modal artifact
+volume, runs a trainer-only Ganker/Megatron Bridge job over that file, runs a
+HF Trainer baseline with matching shifted targets, loss masks, LoRA rank,
+learning rate, and Adam optimizer shape, then prints a JSON report with both
+loss curves and simple agreement metrics.
+
 The generic distributed Modal harness remains available for lower-level smokes
 and back-compat:
 

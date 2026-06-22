@@ -127,6 +127,13 @@ modal_apps/qwen_sft/sft.py
   -> one Tinker-style SFT example
   -> ServiceClient / TrainingClient / SamplingClient only
   -> dataset, tokenizer, train, save, refresh rollout, sample
+
+modal_apps/qwen_sft/compare_hf.py
+  -> one real-data loss-curve comparison
+  -> materializes Alpaca-style JSONL into the artifact volume
+  -> runs trainer-only Ganker/Megatron Bridge
+  -> runs Hugging Face Trainer + PEFT LoRA over the same records
+  -> prints paired loss curves and agreement metrics
 ```
 
 Deploy and run it:
@@ -137,7 +144,17 @@ GANKER_MODAL_GPU=A100 uv run modal deploy modal_apps/qwen_sft/infra.py
 GANKER_MODAL_GPU=A100 uv run modal run modal_apps/qwen_sft/sft.py \
   --startup-timeout 900 \
   --sglang-startup-timeout 900
+GANKER_MODAL_GPU=A100 uv run modal run modal_apps/qwen_sft/compare_hf.py \
+  --startup-timeout 900 \
+  --dataset-size 256 \
+  --max-steps 20 \
+  --sequence-length 256
 ```
+
+The comparison command skips SGLang and uses a trainer-only infra runner with a
+controller-local fake rollout actor, because loss-curve validation does not
+need rollout inference. This keeps the proxy contract intact while avoiding a
+second rollout GPU.
 
 The generic Modal harness remains available for lower-level smokes:
 

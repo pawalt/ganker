@@ -510,6 +510,77 @@ def _start_runtime(
         raise
 
 
+def _start_training_runtime(
+    *,
+    deployment_id: str,
+    run_id: str,
+    artifact_root: str,
+    port: int,
+    controller_port: int,
+    startup_timeout: int,
+    training_config: dict[str, Any],
+) -> dict[str, Any]:
+    add_remote_import_paths()
+    from ganker.actors import ControllerActor, ControllerProxyActor, RolloutActor, TelemetryActor
+    from ganker.distributed.monarch import attach_role_endpoints
+    from monarch.actor import enable_transport, this_host
+
+    runtime: dict[str, Any] = {"trainer_call": None, "rollout_call": None}
+    try:
+        controller_transport = f"tcp://[{_i6pn_address()}]:{controller_port}"
+        enable_transport(controller_transport)
+        runtime["controller_transport"] = controller_transport
+
+        runtime["trainer_call"] = trainer_worker.spawn(deployment_id, run_id, "trainer", 0, port)
+
+        trainer_endpoint = _wait_for_endpoint(
+            deployment_id=deployment_id,
+            run_id=run_id,
+            role="trainer",
+            timeout_seconds=startup_timeout,
+        )
+        runtime["trainer_endpoint"] = trainer_endpoint
+        runtime["rollout_endpoint"] = None
+        runtime["trainer_hosts"] = attach_role_endpoints(
+            [trainer_endpoint],
+            name=f"{deployment_id}_trainer",
+            family="ipv6",
+            transport=None,
+        )
+        runtime["controller_procs"] = this_host().spawn_procs(name=f"{deployment_id}_controller")
+        runtime["trainer_procs"] = runtime["trainer_hosts"].spawn_procs(name=f"{deployment_id}_trainer")
+        runtime["rollout_procs"] = None
+        runtime["rollout_hosts"] = None
+
+        training = runtime["trainer_procs"].spawn(
+            "training",
+            VolumeTrainingActor,
+            artifact_root,
+            "megatron",
+            training_config,
+        )
+        rollout = runtime["controller_procs"].spawn("rollout", RolloutActor, artifact_root, "fake", {})
+        telemetry = runtime["controller_procs"].spawn("telemetry", TelemetryActor)
+        controller = runtime["controller_procs"].spawn("controller", ControllerActor, training, rollout, telemetry)
+        proxy = runtime["controller_procs"].spawn("proxy", ControllerProxyActor, controller)
+        for actor in (training, rollout, telemetry, controller, proxy):
+            actor.initialized.get(timeout=30)
+
+        runtime.update(
+            {
+                "training": training,
+                "rollout": rollout,
+                "telemetry": telemetry,
+                "controller": controller,
+                "proxy": proxy,
+            }
+        )
+        return runtime
+    except Exception:
+        _stop_runtime(runtime)
+        raise
+
+
 def _stop_runtime(runtime: dict[str, Any] | None) -> None:
     if runtime is None:
         return
@@ -531,12 +602,17 @@ def _stop_runtime(runtime: dict[str, Any] | None) -> None:
 
 
 def _context(deployment_id: str, runtime: dict[str, Any]) -> JobContext:
+    rollout_endpoint = runtime.get("rollout_endpoint")
     return JobContext(
         deployment_id=deployment_id,
         region=REGION,
         controller_transport=runtime["controller_transport"],
         trainer_target=runtime["trainer_endpoint"].target(family="ipv6"),
-        rollout_target=runtime["rollout_endpoint"].target(family="ipv6"),
+        rollout_target=(
+            rollout_endpoint.target(family="ipv6")
+            if rollout_endpoint is not None
+            else "controller-local-fake-rollout"
+        ),
     )
 
 
@@ -597,6 +673,61 @@ def run_sft_job(
         )
         timeout = max(float(startup_timeout), float(sglang_startup_timeout)) + 300
         client = ServiceClient(_transport=MonarchProxyTransport(runtime["proxy"], timeout=timeout))
+        job = _load_job(job_module, job_function)
+        return json_safe(job(client, _context(deployment_id, runtime), dict(job_config)))
+    finally:
+        if client is not None:
+            client.close()
+        _stop_runtime(runtime)
+
+
+@app.function(
+    image=bridge_image,
+    timeout=60 * 60,
+    i6pn=True,
+    region=REGION,
+    volumes={ARTIFACT_MOUNT: artifact_volume},
+)
+def run_training_job(
+    deployment_id: str,
+    run_id: str,
+    artifact_root: str,
+    port: int,
+    controller_port: int,
+    startup_timeout: int,
+    job_module: str,
+    job_function: str,
+    job_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Run a training-only job against the Bridge trainer mesh.
+
+    The controller still gets a fake rollout actor so the public proxy contract
+    remains complete, but no SGLang worker or rollout GPU is started.
+    """
+
+    add_remote_import_paths()
+    from ganker.client import ServiceClient
+    from ganker.transport import MonarchProxyTransport
+
+    runtime = None
+    client = None
+    try:
+        runtime = _start_training_runtime(
+            deployment_id=deployment_id,
+            run_id=run_id,
+            artifact_root=artifact_root,
+            port=port,
+            controller_port=controller_port,
+            startup_timeout=startup_timeout,
+            training_config=bridge_training_config(
+                micro_batch_size=int(job_config["micro_batch_size"]),
+                sequence_length=int(job_config["sequence_length"]),
+                seed=int(job_config["seed"]),
+            ),
+        )
+        client = ServiceClient(
+            _transport=MonarchProxyTransport(runtime["proxy"], timeout=float(startup_timeout) + 300)
+        )
         job = _load_job(job_module, job_function)
         return json_safe(job(client, _context(deployment_id, runtime), dict(job_config)))
     finally:
