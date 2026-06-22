@@ -134,6 +134,22 @@ uv run modal run modal_apps/distributed_mesh.py \
   --controller-port 26610
 ```
 
+Real Qwen3 0.6B LoRA SFT through Megatron Bridge:
+
+```bash
+source ~/.codex/modal.env
+GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed_mesh.py \
+  --mode qwen-bridge-sft-distributed \
+  --port 26600 \
+  --controller-port 26610 \
+  --startup-timeout 900 \
+  --tuning lora \
+  --lora-rank 8 \
+  --max-steps 1 \
+  --sequence-length 32 \
+  --micro-batch-size 1
+```
+
 The `fake-distributed` smoke verifies:
 
 ```text
@@ -155,4 +171,20 @@ examples.sft.run_sft(...)
   -> rollout refresh from saved artifact
   -> sample through SamplingClient
   -> telemetry records trainer and rollout usage
+```
+
+The `qwen-bridge-sft-distributed` smoke replaces the fake trainer worker with
+a GPU Modal function running the controlled Megatron Bridge image:
+
+```text
+controller function, Bridge image, CPU
+  -> attach trainer worker, Bridge image, GPU
+  -> attach rollout worker, slim image, CPU fake rollout
+  -> HFAutoTokenizerAdapter(Qwen/Qwen3-0.6B)
+  -> TrainingActor(training_backend="megatron", runtime_kind="bridge")
+  -> load Qwen HF weights through Megatron Bridge
+  -> apply LoRA
+  -> forward_backward + optim_step
+  -> export hf-lora-adapter safetensors to Modal Volume
+  -> rollout refresh + sample through SamplingClient
 ```

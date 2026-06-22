@@ -36,6 +36,15 @@ from ganker.contracts import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REMOTE_ROOT = Path("/workspace/ganker")
 PYTHON_VERSION = os.getenv("GANKER_MODAL_PYTHON", "3.12")
+GPU = os.getenv("GANKER_MODAL_GPU", "L40S")
+BRIDGE_BASE_IMAGE = os.getenv("GANKER_MODAL_BRIDGE_BASE_IMAGE", "nvcr.io/nvidia/pytorch:26.02-py3")
+BRIDGE_REPO = os.getenv(
+    "GANKER_MEGATRON_BRIDGE_REPO",
+    "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git",
+)
+BRIDGE_REF = os.getenv("GANKER_MEGATRON_BRIDGE_REF", "v0.4.2")
+BRIDGE_UV_VERSION = os.getenv("GANKER_MEGATRON_BRIDGE_UV_VERSION", "0.7.2")
+TORCHMONARCH_VERSION = os.getenv("GANKER_MODAL_TORCHMONARCH_VERSION", "0.5.0")
 REGION = os.getenv("GANKER_MODAL_REGION", "us-east-1")
 REGISTRY_NAME = os.getenv("GANKER_DISTRIBUTED_REGISTRY", "ganker-distributed-registry")
 ARTIFACT_VOLUME_NAME = os.getenv("GANKER_DISTRIBUTED_ARTIFACT_VOLUME", "ganker-distributed-artifacts")
@@ -57,7 +66,63 @@ def _base_image():
         .env(
             {
                 "PYTHONPATH": f"{REMOTE_ROOT}:{REMOTE_ROOT / 'src'}",
-                "GANKER_ARTIFACT_ROOT": "/tmp/ganker-artifacts",
+                "GANKER_ARTIFACT_ROOT": ARTIFACT_VOLUME_MOUNT,
+            }
+        )
+        .add_local_dir(
+            PROJECT_ROOT,
+            remote_path=str(REMOTE_ROOT),
+            ignore=[
+                ".git",
+                ".jj",
+                ".venv",
+                ".pytest_cache",
+                ".ruff_cache",
+                "__pycache__",
+                ".local_artifacts",
+            ],
+        )
+    )
+
+
+def _bridge_image():
+    return (
+        modal.Image.from_registry(BRIDGE_BASE_IMAGE)
+        .apt_install("git", "curl")
+        .run_commands(
+            f"curl -LsSf https://astral.sh/uv/{BRIDGE_UV_VERSION}/install.sh | sh",
+            "rm -rf /opt/Megatron-Bridge /opt/venv",
+            (
+                "git clone --depth 1 --branch "
+                f"{BRIDGE_REF} --recurse-submodules --shallow-submodules "
+                f"{BRIDGE_REPO} /opt/Megatron-Bridge"
+            ),
+            "/root/.local/bin/uv venv /opt/venv --system-site-packages",
+            (
+                "cd /opt/Megatron-Bridge && "
+                "UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy "
+                "/root/.local/bin/uv sync --frozen --only-group build"
+            ),
+            (
+                "cd /opt/Megatron-Bridge && "
+                "UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy "
+                "MAX_JOBS=4 NVTE_BUILD_NUM_PHILOX_ROUNDS=3 "
+                "/root/.local/bin/uv sync --link-mode copy --frozen --no-dev "
+                "--no-install-package transformer-engine"
+            ),
+            (
+                "UV_PROJECT_ENVIRONMENT=/opt/venv "
+                f"/root/.local/bin/uv pip install --python /opt/venv/bin/python "
+                f"torchmonarch=={TORCHMONARCH_VERSION}"
+            ),
+        )
+        .env(
+            {
+                "PATH": "/opt/venv/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "VIRTUAL_ENV": "/opt/venv",
+                "UV_PROJECT_ENVIRONMENT": "/opt/venv",
+                "PYTHONPATH": f"{REMOTE_ROOT}:{REMOTE_ROOT / 'src'}:/opt/Megatron-Bridge/src:/opt/Megatron-Bridge/3rdparty/Megatron-LM",
+                "GANKER_ARTIFACT_ROOT": ARTIFACT_VOLUME_MOUNT,
             }
         )
         .add_local_dir(
@@ -77,6 +142,7 @@ def _base_image():
 
 
 image = _base_image()
+bridge_image = _bridge_image()
 app = modal.App("ganker-distributed-mesh")
 registry = modal.Dict.from_name(REGISTRY_NAME, create_if_missing=True)
 artifact_volume = modal.Volume.from_name(ARTIFACT_VOLUME_NAME, create_if_missing=True)
@@ -192,6 +258,47 @@ def monarch_worker_role(
     rank: int,
     port: int,
 ) -> dict[str, Any]:
+    return _run_monarch_worker_loop(
+        deployment_id=deployment_id,
+        run_id=run_id,
+        role=role,
+        rank=rank,
+        port=port,
+    )
+
+
+@app.function(
+    image=bridge_image,
+    gpu=GPU,
+    timeout=60 * 60,
+    i6pn=True,
+    region=REGION,
+    volumes={ARTIFACT_VOLUME_MOUNT: artifact_volume},
+)
+def monarch_bridge_trainer_worker_role(
+    deployment_id: str,
+    run_id: str,
+    role: str,
+    rank: int,
+    port: int,
+) -> dict[str, Any]:
+    return _run_monarch_worker_loop(
+        deployment_id=deployment_id,
+        run_id=run_id,
+        role=role,
+        rank=rank,
+        port=port,
+    )
+
+
+def _run_monarch_worker_loop(
+    *,
+    deployment_id: str,
+    run_id: str,
+    role: str,
+    rank: int,
+    port: int,
+) -> dict[str, Any]:
     _add_remote_import_paths()
     host = _i6pn_address()
     address = f"tcp://[{host}]:{port}"
@@ -245,7 +352,7 @@ def monarch_worker_role(
                 proc.wait(timeout=10)
 
 
-def _start_fake_distributed_runtime(
+def _start_distributed_runtime(
     *,
     deployment_id: str,
     run_id: str,
@@ -253,6 +360,12 @@ def _start_fake_distributed_runtime(
     port: int,
     controller_port: int,
     startup_timeout: int,
+    training_backend: str = "fake",
+    training_backend_config: dict[str, Any] | None = None,
+    inference_backend: str = "fake",
+    inference_backend_config: dict[str, Any] | None = None,
+    trainer_worker: Any = monarch_worker_role,
+    rollout_worker: Any = monarch_worker_role,
 ) -> dict[str, Any]:
     _add_remote_import_paths()
 
@@ -276,8 +389,8 @@ def _start_fake_distributed_runtime(
         enable_transport(controller_transport)
         runtime["controller_transport"] = controller_transport
 
-        runtime["trainer_call"] = monarch_worker_role.spawn(deployment_id, run_id, "trainer", 0, port)
-        runtime["rollout_call"] = monarch_worker_role.spawn(deployment_id, run_id, "rollout", 0, port)
+        runtime["trainer_call"] = trainer_worker.spawn(deployment_id, run_id, "trainer", 0, port)
+        runtime["rollout_call"] = rollout_worker.spawn(deployment_id, run_id, "rollout", 0, port)
 
         trainer_endpoint = RoleEndpoint.from_dict(
             _wait_for_endpoint(
@@ -316,8 +429,20 @@ def _start_fake_distributed_runtime(
         runtime["trainer_procs"] = runtime["trainer_hosts"].spawn_procs(name=f"{deployment_id}_trainer")
         runtime["rollout_procs"] = runtime["rollout_hosts"].spawn_procs(name=f"{deployment_id}_rollout")
 
-        training = runtime["trainer_procs"].spawn("training", ModalVolumeTrainingActor, artifact_root, "fake", None)
-        rollout = runtime["rollout_procs"].spawn("rollout", ModalVolumeRolloutActor, artifact_root, "fake", None)
+        training = runtime["trainer_procs"].spawn(
+            "training",
+            ModalVolumeTrainingActor,
+            artifact_root,
+            training_backend,
+            training_backend_config,
+        )
+        rollout = runtime["rollout_procs"].spawn(
+            "rollout",
+            ModalVolumeRolloutActor,
+            artifact_root,
+            inference_backend,
+            inference_backend_config,
+        )
         telemetry = runtime["controller_procs"].spawn("telemetry", TelemetryActor)
         controller = runtime["controller_procs"].spawn("controller", ControllerActor, training, rollout, telemetry)
         proxy = runtime["controller_procs"].spawn("proxy", ControllerProxyActor, controller)
@@ -335,11 +460,11 @@ def _start_fake_distributed_runtime(
         )
         return runtime
     except Exception:
-        _stop_fake_distributed_runtime(runtime)
+        _stop_distributed_runtime(runtime)
         raise
 
 
-def _stop_fake_distributed_runtime(runtime: dict[str, Any] | None) -> None:
+def _stop_distributed_runtime(runtime: dict[str, Any] | None) -> None:
     if runtime is None:
         return
     for mesh in (runtime.get("trainer_procs"), runtime.get("rollout_procs"), runtime.get("controller_procs")):
@@ -390,7 +515,7 @@ def run_fake_distributed(
 
     runtime = None
     try:
-        runtime = _start_fake_distributed_runtime(
+        runtime = _start_distributed_runtime(
             deployment_id=deployment_id,
             run_id=run_id,
             artifact_root=artifact_root,
@@ -448,7 +573,7 @@ def run_fake_distributed(
             }
         )
     finally:
-        _stop_fake_distributed_runtime(runtime)
+        _stop_distributed_runtime(runtime)
 
 
 @app.function(
@@ -511,7 +636,7 @@ def run_distributed_sft(
     runtime = None
     client = None
     try:
-        runtime = _start_fake_distributed_runtime(
+        runtime = _start_distributed_runtime(
             deployment_id=deployment_id,
             run_id=run_id,
             artifact_root=artifact_root,
@@ -590,7 +715,195 @@ def run_distributed_sft(
     finally:
         if client is not None:
             client.close()
-        _stop_fake_distributed_runtime(runtime)
+        _stop_distributed_runtime(runtime)
+
+
+@app.function(
+    image=bridge_image,
+    timeout=60 * 60,
+    i6pn=True,
+    region=REGION,
+    volumes={ARTIFACT_VOLUME_MOUNT: artifact_volume},
+)
+def run_qwen_bridge_distributed_sft(
+    deployment_id: str,
+    run_id: str,
+    artifact_root: str,
+    port: int,
+    controller_port: int,
+    startup_timeout: int,
+    dataset_path: str,
+    base_model: str,
+    tuning: str,
+    lora_rank: int,
+    max_steps: int,
+    save_every: int,
+    learning_rate: float,
+    sequence_length: int,
+    micro_batch_size: int,
+    seed: int,
+) -> dict[str, Any]:
+    _add_remote_import_paths()
+    if tuning not in {"full", "lora"}:
+        raise ValueError("tuning must be 'full' or 'lora'")
+    if tuning == "lora" and lora_rank <= 0:
+        raise ValueError("lora_rank must be positive for LoRA")
+    tuning_literal = cast(Literal["full", "lora"], tuning)
+
+    from examples.sft import HFAutoTokenizerAdapter, SFTDataConfig, load_jsonl_sft_batches, run_sft
+    from ganker.client import SamplingClient, ServiceClient, TrainingClient
+    from ganker.contracts import (
+        ArtifactKind,
+        ModelInput,
+        SamplingParams,
+        TrainingRun,
+        TuningMode,
+        WeightArtifact,
+    )
+    from ganker.transport import MonarchProxyTransport
+
+    tokenizer = HFAutoTokenizerAdapter.from_pretrained(base_model)
+    batches = load_jsonl_sft_batches(
+        dataset_path,
+        tokenizer=tokenizer,
+        config=SFTDataConfig(
+            sequence_length=sequence_length,
+            batch_size=micro_batch_size,
+            shuffle=True,
+            seed=seed,
+        ),
+    )
+
+    runtime = None
+    client = None
+    try:
+        runtime = _start_distributed_runtime(
+            deployment_id=deployment_id,
+            run_id=run_id,
+            artifact_root=artifact_root,
+            port=port,
+            controller_port=controller_port,
+            startup_timeout=startup_timeout,
+            training_backend="megatron",
+            training_backend_config={
+                "runtime_kind": "bridge",
+                "tensor_device": "cuda",
+                "micro_batch_size": micro_batch_size,
+                "global_batch_size": micro_batch_size,
+                "sequence_length": sequence_length,
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "seed": seed,
+                "trust_remote_code": True,
+                "load_weights": True,
+            },
+            inference_backend="fake",
+            trainer_worker=monarch_bridge_trainer_worker_role,
+            rollout_worker=monarch_worker_role,
+        )
+        client = ServiceClient(
+            _transport=MonarchProxyTransport(runtime["proxy"], timeout=120),
+        )
+        summary = run_sft(
+            client,
+            base_model=base_model,
+            dataset=batches,
+            tuning=tuning_literal,
+            lora_rank=lora_rank if tuning == "lora" else 0,
+            learning_rate=learning_rate,
+            max_steps=max_steps,
+            save_every=save_every,
+        )
+
+        artifact_kind = ArtifactKind.DELTA if tuning == "lora" else ArtifactKind.FULL
+        tuning_mode = TuningMode.LORA if tuning == "lora" else TuningMode.FULL
+        artifact = WeightArtifact(
+            run_id=summary.run_id,
+            checkpoint_version=summary.checkpoint_version,
+            kind=artifact_kind,
+            manifest_path=summary.manifest_path,
+            payload_path=summary.artifact_path,
+        )
+        training_run = TrainingRun(
+            run_id=summary.run_id,
+            base_model=base_model,
+            tuning_mode=tuning_mode,
+            lora_rank=lora_rank if tuning == "lora" else 0,
+            checkpoint_version=summary.checkpoint_version,
+        )
+        training = TrainingClient(service=client, run=training_run)
+        refreshed = training.refresh_weights(
+            artifact,
+            request_id="modal-distributed-qwen-refresh",
+        )
+        sampler = SamplingClient(service=client, run=training_run, artifact=refreshed.artifact)
+        sample = sampler.sample(
+            ModelInput.from_ints([7, 8]),
+            SamplingParams(max_tokens=4, temperature=0.7, top_p=0.9),
+            request_id="modal-distributed-qwen-sample",
+        )
+        telemetry = sampler.get_telemetry_summary(
+            request_id="modal-distributed-qwen-telemetry",
+        )
+        artifact_volume.reload()
+
+        payload = {
+            "ok": True,
+            "mode": "qwen-bridge-sft-distributed",
+            "runtime_kind": "bridge",
+            "bridge_base_image": BRIDGE_BASE_IMAGE,
+            "bridge_ref": BRIDGE_REF,
+            "deployment_id": deployment_id,
+            "region": REGION,
+            "controller_transport": runtime["controller_transport"],
+            "trainer_target": runtime["trainer_endpoint"].target(family="ipv6"),
+            "rollout_target": runtime["rollout_endpoint"].target(family="ipv6"),
+            "dataset_path": dataset_path,
+            "batch_count": len(batches),
+            "tuning": tuning,
+            "lora_rank": lora_rank if tuning == "lora" else 0,
+            "sample_tokens": sample.sequences[0].tokens,
+            "sample_checkpoint_version": sample.artifact.checkpoint_version,
+            "telemetry_events": telemetry.summary.event_count,
+            "telemetry_input_tokens": telemetry.summary.total.input_tokens,
+            "telemetry_output_tokens": telemetry.summary.total.output_tokens,
+            "telemetry_training_steps": telemetry.summary.total.training_steps,
+            "telemetry_samples": telemetry.summary.total.samples,
+            **summary.to_dict(),
+        }
+        payload["artifact_exists"] = Path(summary.artifact_path).exists()
+        payload["manifest_exists"] = Path(summary.manifest_path).exists()
+        if payload["artifact_exists"]:
+            artifact_payload = json.loads(Path(summary.artifact_path).read_text())
+            payload["artifact_format"] = artifact_payload.get("artifact_format")
+            for key in (
+                "hf_checkpoint_path",
+                "hf_adapter_path",
+                "hf_weights_path",
+                "hf_weights_index_path",
+                "hf_adapter_config_path",
+                "hf_adapter_weights_path",
+                "hf_checkpoint_bytes",
+                "hf_weight_count",
+                "hf_weight_format",
+            ):
+                if key in artifact_payload:
+                    payload[key] = artifact_payload[key]
+            for key in (
+                "hf_checkpoint_path",
+                "hf_adapter_path",
+                "hf_weights_path",
+                "hf_weights_index_path",
+                "hf_adapter_config_path",
+                "hf_adapter_weights_path",
+            ):
+                if key in payload:
+                    payload[f"{key}_exists"] = Path(payload[key]).exists()
+        return _json_safe(payload)
+    finally:
+        if client is not None:
+            client.close()
+        _stop_distributed_runtime(runtime)
 
 
 @app.function(image=image, timeout=10 * 60, i6pn=True, region=REGION)
@@ -663,13 +976,13 @@ def main(
     mode: str = "fake-distributed",
     dataset_path: str = str(REMOTE_ROOT / "examples" / "tiny_sft.jsonl"),
     artifact_root: str = str(ARTIFACT_VOLUME_ROOT),
-    base_model: str = "local/tiny-sft",
+    base_model: str = "Qwen/Qwen3-0.6B",
     tuning: str = "lora",
     lora_rank: int = 8,
-    max_steps: int = 4,
-    save_every: int = 2,
+    max_steps: int = 1,
+    save_every: int = 0,
     learning_rate: float = 1e-4,
-    sequence_length: int = 64,
+    sequence_length: int = 32,
     micro_batch_size: int = 1,
     vocab_size: int = 128,
     seed: int = 1234,
@@ -679,7 +992,7 @@ def main(
     deployment_id: str = "",
     run_id: str = "run-000001",
 ):
-    if mode not in {"fake-distributed", "sft-distributed", "tcp-smoke"}:
+    if mode not in {"fake-distributed", "qwen-bridge-sft-distributed", "sft-distributed", "tcp-smoke"}:
         raise ValueError(f"unknown mode: {mode}")
     deployment = deployment_id or f"dev-{uuid.uuid4().hex[:8]}"
     if mode == "tcp-smoke":
@@ -702,6 +1015,25 @@ def main(
             sequence_length,
             micro_batch_size,
             vocab_size,
+            seed,
+        )
+    elif mode == "qwen-bridge-sft-distributed":
+        result = run_qwen_bridge_distributed_sft.remote(
+            deployment,
+            run_id,
+            artifact_root,
+            port,
+            controller_port,
+            startup_timeout,
+            dataset_path,
+            base_model,
+            tuning,
+            lora_rank,
+            max_steps,
+            save_every,
+            learning_rate,
+            sequence_length,
+            micro_batch_size,
             seed,
         )
     else:

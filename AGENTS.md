@@ -56,6 +56,7 @@ uv run pytest
 - Distributed Monarch attach across Modal containers needs a reachable controller transport too. Call `enable_transport("tcp://[controller-i6pn]:port")` before any other Monarch API in the controller container, then `attach_to_workers(...)` against worker endpoints like `tcp://[worker-i6pn]:26600`.
 - Distributed Modal smoke tests live in `modal_apps/distributed_mesh.py`. Use `source ~/.codex/modal.env` and `uv run modal run modal_apps/distributed_mesh.py --mode tcp-smoke --port 26620` to verify private i6pn TCP, then `uv run modal run modal_apps/distributed_mesh.py --mode fake-distributed --port 26600 --controller-port 26610` to verify Monarch `attach_to_workers`.
 - Full distributed SFT smoke runs with `uv run modal run modal_apps/distributed_mesh.py --mode sft-distributed --port 26600 --controller-port 26610`. It uses a Modal Volume mounted at `/vol/ganker-artifacts`; trainer actors must commit after `save_weights`, and rollout/controller code must reload before reading saved artifacts.
+- Real distributed Qwen/Megatron Bridge SFT runs with `GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed_mesh.py --mode qwen-bridge-sft-distributed --port 26600 --controller-port 26610 --startup-timeout 900 --tuning lora --lora-rank 8 --max-steps 1 --sequence-length 32 --micro-batch-size 1`. This uses a GPU Bridge trainer worker and a CPU fake rollout worker over Monarch/i6pn.
 - Keep tests lightweight enough to run with `uv run pytest` on a CPU-only development machine.
 
 ## gRPC Codegen
