@@ -98,28 +98,24 @@ modal run modal_apps/sglang_smoke.py --mode client
 That smoke starts SGLang for `Qwen/Qwen3-0.6B`, then samples through
 `ServiceClient.local(..., inference_backend="sglang")`.
 
-Distributed Modal orchestration has two CPU-only smokes:
+Distributed Modal orchestration is split between deployable infra and job code:
 
 ```bash
 source ~/.codex/modal.env
-uv run modal run modal_apps/distributed_mesh.py --mode tcp-smoke --port 26620
-uv run modal run modal_apps/distributed_mesh.py --mode fake-distributed --port 26600 --controller-port 26610
-uv run modal run modal_apps/distributed_mesh.py --mode sft-distributed --port 26600 --controller-port 26610
-GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed_mesh.py --mode qwen-bridge-sft-distributed --port 26600 --controller-port 26610 --startup-timeout 900 --tuning lora --lora-rank 8 --max-steps 1 --sequence-length 32 --micro-batch-size 1
-GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed_mesh.py --mode qwen-bridge-sglang-distributed --port 26600 --controller-port 26610 --startup-timeout 900 --sglang-startup-timeout 900 --tuning lora --lora-rank 8 --max-steps 1 --sequence-length 32 --micro-batch-size 1
+uv run modal deploy modal_apps/distributed/infra.py
+uv run modal run modal_apps/distributed/sft_job.py --mode tcp-smoke --port 26620
+uv run modal run modal_apps/distributed/sft_job.py --mode fake-distributed --port 26600 --controller-port 26610
+uv run modal run modal_apps/distributed/sft_job.py --mode sft-distributed --port 26600 --controller-port 26610
+GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed/sft_job.py --mode qwen-bridge-sft-distributed --port 26600 --controller-port 26610 --startup-timeout 900 --tuning lora --lora-rank 8 --max-steps 1 --sequence-length 32 --micro-batch-size 1
+GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed/sft_job.py --mode qwen-bridge-sglang-distributed --port 26600 --controller-port 26610 --startup-timeout 900 --sglang-startup-timeout 900 --tuning lora --lora-rank 8 --max-steps 1 --sequence-length 32 --micro-batch-size 1
 ```
 
-The first verifies private i6pn TCP between Modal functions. The second verifies
-Monarch `attach_to_workers` over i6pn with separate trainer and rollout worker
-containers. The third runs a full toy SFT loop through the distributed
-controller path, saves weights to a shared Modal Volume, refreshes rollout, and
-samples from the saved artifact. The fourth runs real Qwen3 0.6B LoRA SFT
-through Megatron Bridge on a GPU trainer worker, exports a PEFT safetensors
-adapter, refreshes a fake rollout, and samples from that adapter artifact. The
-fifth keeps the same Bridge trainer but runs a separate GPU SGLang rollout
-worker, loads the exported HF/PEFT LoRA adapter through SGLang, and samples text
-through `SamplingClient`. All i6pn roles must be pinned to the same exact
-region, currently `us-east-1`.
+`modal_apps/distributed/infra.py` owns images, Modal functions, volumes,
+worker rendezvous, and Monarch attach. `modal_apps/distributed/sft_job.py`
+contains the Tinker-style client code that trains, saves, refreshes rollout,
+and samples. The compatibility wrapper at `modal_apps/distributed_mesh.py`
+still forwards the old commands. All i6pn roles must be pinned to the same
+exact region, currently `us-east-1`.
 
 Megatron adapter preflight tests run locally without a GPU:
 

@@ -113,18 +113,42 @@ multi-node training; it is not required for i6pn connectivity.
 
 ## Smoke Tests
 
+The Modal implementation is split into:
+
+```text
+modal_apps/distributed/infra.py
+  -> Modal app, images, volumes, i6pn worker roles, Monarch attach
+  -> generic run_cpu_distributed_job / run_bridge_distributed_job
+  -> deployable with modal deploy
+
+modal_apps/distributed/sft_job.py
+  -> Tinker-style ServiceClient / TrainingClient / SamplingClient code
+  -> job-specific dataset, tokenizer, training, refresh, sampling
+  -> modal run entrypoint for smokes and SFT jobs
+
+modal_apps/distributed_mesh.py
+  -> compatibility wrapper for older commands
+```
+
+Deploy the infra independently:
+
+```bash
+source ~/.codex/modal.env
+uv run modal deploy modal_apps/distributed/infra.py
+```
+
 Plain private IPv6 TCP:
 
 ```bash
 source ~/.codex/modal.env
-uv run modal run modal_apps/distributed_mesh.py --mode tcp-smoke --port 26620
+uv run modal run modal_apps/distributed/sft_job.py --mode tcp-smoke --port 26620
 ```
 
 Monarch attach plus fake training flow:
 
 ```bash
 source ~/.codex/modal.env
-uv run modal run modal_apps/distributed_mesh.py \
+uv run modal run modal_apps/distributed/sft_job.py \
   --mode fake-distributed \
   --port 26600 \
   --controller-port 26610
@@ -134,7 +158,7 @@ Full toy SFT job through the distributed topology:
 
 ```bash
 source ~/.codex/modal.env
-uv run modal run modal_apps/distributed_mesh.py \
+uv run modal run modal_apps/distributed/sft_job.py \
   --mode sft-distributed \
   --port 26600 \
   --controller-port 26610
@@ -144,7 +168,7 @@ Real Qwen3 0.6B LoRA SFT through Megatron Bridge:
 
 ```bash
 source ~/.codex/modal.env
-GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed_mesh.py \
+GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed/sft_job.py \
   --mode qwen-bridge-sft-distributed \
   --port 26600 \
   --controller-port 26610 \
@@ -160,7 +184,7 @@ Real Qwen3 0.6B LoRA SFT through Megatron Bridge plus SGLang rollout:
 
 ```bash
 source ~/.codex/modal.env
-GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed_mesh.py \
+GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed/sft_job.py \
   --mode qwen-bridge-sglang-distributed \
   --port 26600 \
   --controller-port 26610 \

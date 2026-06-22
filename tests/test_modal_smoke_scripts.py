@@ -95,3 +95,27 @@ def test_distributed_mesh_modal_app_compiles():
         ],
         check=True,
     )
+
+
+def test_distributed_modal_infra_compiles():
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            "modal_apps/distributed/infra.py",
+        ],
+        check=True,
+    )
+
+
+def test_distributed_sft_job_compiles():
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            "modal_apps/distributed/sft_job.py",
+        ],
+        check=True,
+    )
