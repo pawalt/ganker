@@ -1,6 +1,6 @@
 # RFC 0005: Qwen3 0.6B Megatron Bridge SFT
 
-Status: Implemented
+Status: Implemented, updated by RFC 0006
 
 ## Summary
 
@@ -25,8 +25,8 @@ examples/tiny_sft.jsonl
 ## Decisions
 
 - Use `Qwen/Qwen3-0.6B` as the first Bridge-backed model.
-- Use full fine-tuning, not LoRA.
-- Use the NVIDIA NeMo Framework container as the Bridge image.
+- Use full fine-tuning first. LoRA is added in RFC 0006.
+- Use the NVIDIA NeMo Framework container as the first working Bridge image. RFC 0006 replaces this with a controlled NGC PyTorch + pinned Bridge source image.
 - Keep SFT data and loop helpers under `examples/sft`, not `src/ganker`.
 - Export HF full checkpoints first.
 - Skip dataset packing; fixed-length padded batches are enough for the small dataset path.
@@ -82,7 +82,7 @@ generation_config.json when available
 pytorch_model.bin
 ```
 
-The `.bin` format tolerates shared/tied tensors and is a valid HF full-checkpoint format for this milestone.
+The `.bin` format tolerated shared/tied tensors and was valid for this milestone. RFC 0006 replaces this with safetensors export that clones tied tensors before writing.
 
 ## Command
 
@@ -111,4 +111,3 @@ Expected output includes:
 - Add a small eval/sample check after checkpoint export.
 - Add LoRA once adapter insertion is implemented and tested.
 - Move from one-GPU smoke to a more production-like multi-GPU setup only after the single-GPU lifecycle stays stable.
-

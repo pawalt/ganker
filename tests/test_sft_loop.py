@@ -136,3 +136,22 @@ def test_run_sft_honors_max_steps_and_save_every():
     assert client.training is not None
     assert len(client.training.forwarded) == 2
     assert client.training.saved_kinds == [ArtifactKind.FULL, ArtifactKind.FULL]
+
+
+def test_run_sft_saves_lora_runs_as_delta_artifacts():
+    client = FakeServiceClient()
+    dataset = [[_datum([1, 2, 3])]]
+
+    summary = run_sft(
+        client,
+        base_model="local/tiny-config",
+        dataset=dataset,
+        tuning="lora",
+        lora_rank=8,
+        max_steps=1,
+    )
+
+    assert client.created == [("local/tiny-config", "lora", 8)]
+    assert summary.tuning == "lora"
+    assert client.training is not None
+    assert client.training.saved_kinds == [ArtifactKind.DELTA]

@@ -10,6 +10,7 @@ from ganker.backends.megatron import (
     InProcessMegatronCoreRuntime,
     MegatronRunHandle,
     MegatronTrainingBackend,
+    _write_safetensors_state_dict,
     datums_to_tensor_batch,
 )
 from ganker.config import MegatronBackendConfig
@@ -132,6 +133,8 @@ def test_installed_runtime_maps_config_to_bridge_provider():
     assert handle.provider.tensor_model_parallel_size == 2
     assert handle.provider.pipeline_model_parallel_size == 1
     assert handle.provider.finalized is True
+    assert handle.tuning_mode is TuningMode.LORA
+    assert handle.lora_rank == 8
 
 
 def test_datums_to_tensor_batch_validates_required_inputs_without_torch():
@@ -158,6 +161,24 @@ def test_datums_to_tensor_batch_uses_cpu_tensors_when_torch_is_available():
     assert batch.input_ids.tolist() == [[1, 2, 3], [4, 5, 6]]
     assert batch.target_tokens.tolist() == [[2, 3, 0], [5, 6, 0]]
     assert batch.weights.tolist() == [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]
+
+
+def test_safetensors_writer_clones_tied_tensors(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    safetensors = pytest.importorskip("safetensors.torch")
+
+    tied = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    payload = _write_safetensors_state_dict(
+        {
+            "model.embed_tokens.weight": tied,
+            "lm_head.weight": tied,
+        },
+        checkpoint_dir=tmp_path,
+    )
+
+    weights = safetensors.load_file(payload["hf_weights_path"])
+    assert weights["model.embed_tokens.weight"].tolist() == [[0.0, 1.0], [2.0, 3.0]]
+    assert weights["lm_head.weight"].tolist() == [[0.0, 1.0], [2.0, 3.0]]
 
 
 class FakeMegatronRuntime:

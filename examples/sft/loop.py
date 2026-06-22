@@ -54,6 +54,7 @@ def run_sft(
     training_steps = 0
     optimizer_step = 0
     checkpoint_version = training.run.checkpoint_version
+    artifact_kind = ArtifactKind.DELTA if _tuning_name(tuning) == "lora" else ArtifactKind.FULL
     saved = None
 
     for batch in dataset:
@@ -67,12 +68,12 @@ def run_sft(
         optimizer_step = int(step.optimizer_step)
         checkpoint_version = int(step.checkpoint_version)
         if save_every and optimizer_step % save_every == 0:
-            saved = training.save_weights(kind=ArtifactKind.FULL)
+            saved = training.save_weights(kind=artifact_kind)
 
     if not losses:
         raise ValueError("dataset produced no SFT steps")
     if saved is None:
-        saved = training.save_weights(kind=ArtifactKind.FULL)
+        saved = training.save_weights(kind=artifact_kind)
 
     return SFTRunSummary(
         ok=True,
@@ -95,4 +96,3 @@ def _tuning_name(tuning: TuningMode | Literal["lora", "full"]) -> str:
     if isinstance(tuning, TuningMode):
         return tuning.name.lower()
     return tuning
-

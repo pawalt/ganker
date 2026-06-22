@@ -7,6 +7,7 @@ from enum import Enum
 from functools import partial
 from itertools import count
 import importlib
+import json
 import os
 from pathlib import Path
 import socket
@@ -58,6 +59,9 @@ class MegatronRunHandle:
     config: Any = None
     distributed_context: Any = None
     base_model: str = ""
+    tuning_mode: TuningMode = TuningMode.FULL
+    lora_rank: int = 0
+    peft_config: Any = None
 
 
 class _RunStatus(Enum):
@@ -149,12 +153,15 @@ class InstalledMegatronBridgeRuntime:
         lora_rank: int,
         config: MegatronBackendConfig,
     ) -> MegatronRunHandle:
-        _ = tuning_mode, lora_rank
         auto_bridge = self._bridge.AutoBridge.from_hf_pretrained(
             base_model,
             trust_remote_code=config.trust_remote_code,
         )
-        provider = auto_bridge.to_megatron_provider(load_weights=False)
+        provider = _to_megatron_provider(
+            auto_bridge,
+            load_weights=config.load_weights,
+            hf_path=base_model if config.load_weights else None,
+        )
         provider.tensor_model_parallel_size = config.tensor_model_parallel_size
         provider.pipeline_model_parallel_size = config.pipeline_model_parallel_size
         if hasattr(provider, "seq_length"):
@@ -163,6 +170,7 @@ class InstalledMegatronBridgeRuntime:
             provider.micro_batch_size = config.micro_batch_size
         if hasattr(provider, "global_batch_size"):
             provider.global_batch_size = config.global_batch_size
+        peft_config = None
 
         # Unit tests use a fake provider to validate config mapping without
         # requiring torch, Megatron, CUDA, or model downloads.
@@ -173,6 +181,8 @@ class InstalledMegatronBridgeRuntime:
                 bridge=auto_bridge,
                 provider=provider,
                 base_model=base_model,
+                tuning_mode=tuning_mode,
+                lora_rank=lora_rank,
             )
 
         torch = _import_torch()
@@ -200,17 +210,24 @@ class InstalledMegatronBridgeRuntime:
         if hasattr(provider, "finalize"):
             provider.finalize()
 
+        if tuning_mode is TuningMode.LORA:
+            peft_config = _build_lora_config(lora_rank)
+            provider.register_pre_wrap_hook(
+                lambda chunks: _apply_peft_config(peft_config, chunks, training=True)
+            )
+
         from megatron.core.distributed import DistributedDataParallelConfig
         from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 
-        model = auto_bridge.to_megatron_model(
-            load_weights=config.load_weights,
-            hf_path=base_model if config.load_weights else None,
+        model = provider.provide_distributed_model(
             ddp_config=DistributedDataParallelConfig(),
             wrap_with_ddp=True,
         )
 
-        optimizer = torch.optim.Adam(_model_parameters(model), lr=1e-4)
+        optimizer_params = list(_trainable_model_parameters(model))
+        if not optimizer_params:
+            raise BackendUnavailableError("Megatron Bridge model has no trainable parameters")
+        optimizer = torch.optim.Adam(optimizer_params, lr=1e-4)
         return MegatronRunHandle(
             bridge=auto_bridge,
             provider=provider,
@@ -219,6 +236,9 @@ class InstalledMegatronBridgeRuntime:
             forward_backward_schedule=get_forward_backward_func(),
             config={"device": device, "runtime": "megatron-bridge"},
             base_model=base_model,
+            tuning_mode=tuning_mode,
+            lora_rank=lora_rank,
+            peft_config=peft_config,
         )
 
     def forward_backward(
@@ -276,18 +296,30 @@ class InstalledMegatronBridgeRuntime:
         if handle.bridge is None or handle.model is None:
             raise BackendUnavailableError("Megatron Bridge model is not initialized")
         checkpoint_dir = Path(os.getenv("GANKER_ARTIFACT_ROOT", "/tmp/ganker-artifacts"))
-        checkpoint_dir = checkpoint_dir / "hf-full" / run_id / f"checkpoint-{checkpoint_version:06d}"
+        artifact_subdir = "hf-lora" if handle.tuning_mode is TuningMode.LORA else "hf-full"
+        checkpoint_dir = checkpoint_dir / artifact_subdir / run_id / f"checkpoint-{checkpoint_version:06d}"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        hf_payload = _save_bridge_hf_checkpoint(
-            bridge=handle.bridge,
-            model=handle.model,
-            base_model=handle.base_model,
-            checkpoint_dir=checkpoint_dir,
-        )
+        if handle.tuning_mode is TuningMode.LORA:
+            hf_payload = _save_bridge_lora_adapter(
+                bridge=handle.bridge,
+                model=handle.model,
+                base_model=handle.base_model,
+                checkpoint_dir=checkpoint_dir,
+                peft_config=handle.peft_config,
+            )
+            artifact_format = "hf-lora-adapter"
+        else:
+            hf_payload = _save_bridge_hf_checkpoint(
+                bridge=handle.bridge,
+                model=handle.model,
+                base_model=handle.base_model,
+                checkpoint_dir=checkpoint_dir,
+            )
+            artifact_format = "hf-full-safetensors"
         return {
             "backend": "megatron-bridge",
             "runtime": "megatron-bridge",
-            "artifact_format": "hf-full",
+            "artifact_format": artifact_format,
             "checkpoint_path": str(checkpoint_dir),
             **hf_payload,
         }
@@ -530,6 +562,39 @@ def _model_parameters(model: Any):
         yield from chunk.parameters()
 
 
+def _trainable_model_parameters(model: Any):
+    for param in _model_parameters(model):
+        if getattr(param, "requires_grad", True):
+            yield param
+
+
+def _build_lora_config(lora_rank: int) -> Any:
+    LoRA = importlib.import_module("megatron.bridge.peft.lora").LoRA
+    return LoRA(
+        target_modules=["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
+        dim=lora_rank,
+        alpha=2 * lora_rank,
+        dropout=0.0,
+    )
+
+
+def _apply_peft_config(peft_config: Any, model: Any, *, training: bool) -> Any:
+    transformed = peft_config(model, training=training)
+    set_params_to_save = getattr(peft_config, "set_params_to_save", None)
+    if callable(set_params_to_save):
+        set_params_to_save(transformed)
+    return transformed
+
+
+def _to_megatron_provider(auto_bridge: Any, *, load_weights: bool, hf_path: str | None) -> Any:
+    try:
+        return auto_bridge.to_megatron_provider(load_weights=load_weights, hf_path=hf_path)
+    except TypeError as exc:
+        if "hf_path" not in str(exc):
+            raise
+        return auto_bridge.to_megatron_provider(load_weights=load_weights)
+
+
 def _save_bridge_hf_checkpoint(
     *,
     bridge: Any,
@@ -537,7 +602,6 @@ def _save_bridge_hf_checkpoint(
     base_model: str,
     checkpoint_dir: Path,
 ) -> dict[str, Any]:
-    torch = _import_torch()
     from transformers import AutoConfig, AutoTokenizer
 
     config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
@@ -556,24 +620,101 @@ def _save_bridge_hf_checkpoint(
     except Exception:
         pass
 
-    state_dict = {}
+    state_dict: dict[str, Any] = {}
     for item in bridge.export_hf_weights(model, cpu=True, show_progress=False):
         name = getattr(item, "param_name", None)
         weight = getattr(item, "weight", None)
         if name is None or weight is None:
             name, weight = item
-        state_dict[str(name)] = weight.detach().cpu().clone()
+        state_dict[str(name)] = weight.detach().cpu().contiguous().clone()
 
-    weights_path = checkpoint_dir / "pytorch_model.bin"
-    torch.save(state_dict, weights_path)
+    weights_payload = _write_safetensors_state_dict(
+        state_dict,
+        checkpoint_dir=checkpoint_dir,
+    )
     return {
         "hf_checkpoint_path": str(checkpoint_dir),
-        "hf_weights_path": str(weights_path),
+        "hf_weight_format": "safetensors",
         "hf_checkpoint_bytes": sum(
             path.stat().st_size for path in checkpoint_dir.rglob("*") if path.is_file()
         ),
         "hf_weight_count": len(state_dict),
+        **weights_payload,
     }
+
+
+def _save_bridge_lora_adapter(
+    *,
+    bridge: Any,
+    model: Any,
+    base_model: str,
+    checkpoint_dir: Path,
+    peft_config: Any,
+) -> dict[str, Any]:
+    if peft_config is None:
+        raise BackendUnavailableError("LoRA run is missing PEFT config")
+    bridge.save_hf_adapter(
+        model,
+        checkpoint_dir,
+        peft_config=peft_config,
+        base_model_name_or_path=base_model,
+        show_progress=False,
+    )
+    weights_path = checkpoint_dir / "adapter_model.safetensors"
+    config_path = checkpoint_dir / "adapter_config.json"
+    return {
+        "hf_adapter_path": str(checkpoint_dir),
+        "hf_adapter_config_path": str(config_path),
+        "hf_adapter_weights_path": str(weights_path),
+        "hf_weight_format": "safetensors",
+        "hf_checkpoint_bytes": sum(
+            path.stat().st_size for path in checkpoint_dir.rglob("*") if path.is_file()
+        ),
+        "hf_weight_count": _safetensors_tensor_count(weights_path),
+    }
+
+
+def _write_safetensors_state_dict(
+    state_dict: dict[str, Any],
+    *,
+    checkpoint_dir: Path,
+    max_shard_size: str = "5GB",
+) -> dict[str, Any]:
+    from huggingface_hub import split_torch_state_dict_into_shards
+    from safetensors.torch import save_file
+
+    plan = split_torch_state_dict_into_shards(
+        state_dict,
+        max_shard_size=max_shard_size,
+        filename_pattern="model{suffix}.safetensors",
+    )
+    weight_files: list[str] = []
+    for filename, tensor_names in plan.filename_to_tensors.items():
+        shard = {name: state_dict[name] for name in tensor_names}
+        path = checkpoint_dir / filename
+        save_file(shard, path, metadata={"format": "pt"})
+        weight_files.append(str(path))
+    payload: dict[str, Any] = {
+        "hf_weight_files": weight_files,
+    }
+    if plan.is_sharded:
+        index_path = checkpoint_dir / "model.safetensors.index.json"
+        index = {"metadata": plan.metadata, "weight_map": plan.tensor_to_filename}
+        index_path.write_text(json.dumps(index, sort_keys=True, indent=2), encoding="utf-8")
+        payload["hf_weights_index_path"] = str(index_path)
+    else:
+        payload["hf_weights_path"] = weight_files[0]
+    return payload
+
+
+def _safetensors_tensor_count(path: Path) -> int:
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return 0
+
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        return len(handle.keys())
 
 
 def _free_port() -> int:

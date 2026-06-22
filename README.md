@@ -106,6 +106,7 @@ source ~/.codex/modal.env
 modal run modal_apps/sft.py --mode env
 modal run modal_apps/sft.py --mode toy-sft
 modal run modal_apps/sft.py --mode hf-small-sft --max-steps 1 --sequence-length 32
+modal run modal_apps/sft.py --mode hf-small-sft --tuning lora --lora-rank 8 --max-steps 1 --sequence-length 32
 ```
 
 The first SFT path lives under `examples/sft/`, uses a deterministic toy
@@ -113,10 +114,22 @@ tokenizer, converts `examples/tiny_sft.jsonl` into `Datum` batches, and drives
 `ServiceClient -> TrainingClient` with full fine-tuning semantics against the
 tiny Megatron-Core runtime.
 
-The `hf-small-sft` mode runs Qwen3 0.6B through Megatron Bridge inside the
-NVIDIA NeMo container (`GANKER_MODAL_BRIDGE_IMAGE`, default
-`nvcr.io/nvidia/nemo:25.09.02`). It loads pretrained HF weights, performs a
-full fine-tuning step through the same public Ganker client path, and exports a
-full HF checkpoint directory with `pytorch_model.bin`.
+The `hf-small-sft` mode runs Qwen3 0.6B through Megatron Bridge inside a
+controlled Bridge image. By default the Modal image starts from
+`nvcr.io/nvidia/pytorch:26.02-py3`, clones
+`NVIDIA-NeMo/Megatron-Bridge@v0.4.2`, and installs from Bridge's own
+`uv.lock`. It loads pretrained HF weights and supports either full tuning or
+LoRA through the same public Ganker client path. Full tuning exports an HF
+safetensors checkpoint; LoRA exports a PEFT-compatible
+`adapter_config.json` plus `adapter_model.safetensors`.
+
+Useful Bridge image overrides:
+
+```bash
+GANKER_MODAL_BRIDGE_BASE_IMAGE=nvcr.io/nvidia/pytorch:<tag> \
+GANKER_MEGATRON_BRIDGE_REF=v0.4.2 \
+GANKER_MODAL_TORCHMONARCH_VERSION=0.5.0 \
+modal run modal_apps/sft.py --mode hf-small-sft --tuning lora
+```
 
 See `architecture/` for the local orchestration diagrams.

@@ -24,7 +24,14 @@ REMOTE_ROOT = Path("/workspace/ganker")
 PYTHON_VERSION = os.getenv("GANKER_MODAL_PYTHON", "3.12")
 GPU = os.getenv("GANKER_MODAL_GPU", "L40S")
 BASE_IMAGE = os.getenv("GANKER_MODAL_BASE_IMAGE", "")
-BRIDGE_BASE_IMAGE = os.getenv("GANKER_MODAL_BRIDGE_IMAGE", "nvcr.io/nvidia/nemo:25.09.02")
+BRIDGE_BASE_IMAGE = os.getenv("GANKER_MODAL_BRIDGE_BASE_IMAGE", "nvcr.io/nvidia/pytorch:26.02-py3")
+BRIDGE_REPO = os.getenv(
+    "GANKER_MEGATRON_BRIDGE_REPO",
+    "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git",
+)
+BRIDGE_REF = os.getenv("GANKER_MEGATRON_BRIDGE_REF", "v0.4.2")
+BRIDGE_UV_VERSION = os.getenv("GANKER_MEGATRON_BRIDGE_UV_VERSION", "0.7.2")
+TORCHMONARCH_VERSION = os.getenv("GANKER_MODAL_TORCHMONARCH_VERSION", "0.5.0")
 
 
 def _base_image():
@@ -71,10 +78,40 @@ def _common_image():
 def _bridge_image():
     return (
         modal.Image.from_registry(BRIDGE_BASE_IMAGE)
-        .run_commands("python -m pip install --no-deps torchmonarch==0.4.0")
+        .apt_install("git", "curl")
+        .run_commands(
+            f"curl -LsSf https://astral.sh/uv/{BRIDGE_UV_VERSION}/install.sh | sh",
+            "rm -rf /opt/Megatron-Bridge /opt/venv",
+            (
+                "git clone --depth 1 --branch "
+                f"{BRIDGE_REF} --recurse-submodules --shallow-submodules "
+                f"{BRIDGE_REPO} /opt/Megatron-Bridge"
+            ),
+            "/root/.local/bin/uv venv /opt/venv --system-site-packages",
+            (
+                "cd /opt/Megatron-Bridge && "
+                "UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy "
+                "/root/.local/bin/uv sync --frozen --only-group build"
+            ),
+            (
+                "cd /opt/Megatron-Bridge && "
+                "UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy "
+                "MAX_JOBS=4 NVTE_BUILD_NUM_PHILOX_ROUNDS=3 "
+                "/root/.local/bin/uv sync --link-mode copy --frozen --no-dev "
+                "--no-install-package transformer-engine"
+            ),
+            (
+                "UV_PROJECT_ENVIRONMENT=/opt/venv "
+                f"/root/.local/bin/uv pip install --python /opt/venv/bin/python "
+                f"torchmonarch=={TORCHMONARCH_VERSION}"
+            ),
+        )
         .env(
             {
-                "PYTHONPATH": f"{REMOTE_ROOT}:{REMOTE_ROOT / 'src'}",
+                "PATH": "/opt/venv/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "VIRTUAL_ENV": "/opt/venv",
+                "UV_PROJECT_ENVIRONMENT": "/opt/venv",
+                "PYTHONPATH": f"{REMOTE_ROOT}:{REMOTE_ROOT / 'src'}:/opt/Megatron-Bridge/src:/opt/Megatron-Bridge/3rdparty/Megatron-LM",
                 "GANKER_ARTIFACT_ROOT": "/tmp/ganker-artifacts",
             }
         )
@@ -199,6 +236,8 @@ def _run_hf_small_sft(
     dataset_path: str,
     artifact_root: str,
     base_model: str,
+    tuning: str,
+    lora_rank: int,
     max_steps: int,
     save_every: int,
     learning_rate: float,
@@ -207,6 +246,10 @@ def _run_hf_small_sft(
     seed: int,
 ) -> dict[str, Any]:
     _add_remote_import_paths()
+    if tuning not in ("full", "lora"):
+        raise ValueError("tuning must be 'full' or 'lora'")
+    if tuning == "lora" and lora_rank <= 0:
+        raise ValueError("lora_rank must be positive for LoRA")
 
     from examples.sft import HFAutoTokenizerAdapter, SFTDataConfig, load_jsonl_sft_batches, run_sft
     from ganker import ServiceClient
@@ -246,8 +289,8 @@ def _run_hf_small_sft(
             client,
             base_model=base_model,
             dataset=batches,
-            tuning="full",
-            lora_rank=0,
+            tuning=tuning,
+            lora_rank=lora_rank if tuning == "lora" else 0,
             learning_rate=learning_rate,
             max_steps=max_steps,
             save_every=save_every,
@@ -256,6 +299,10 @@ def _run_hf_small_sft(
             "ok": True,
             "mode": "hf-small-sft",
             "runtime_kind": "bridge",
+            "bridge_base_image": BRIDGE_BASE_IMAGE,
+            "bridge_ref": BRIDGE_REF,
+            "tuning": tuning,
+            "lora_rank": lora_rank if tuning == "lora" else 0,
             "dataset_path": dataset_path,
             "batch_count": len(batches),
             **summary.to_dict(),
@@ -263,12 +310,30 @@ def _run_hf_small_sft(
         payload["artifact_exists"] = Path(summary.artifact_path).exists()
         if payload["artifact_exists"]:
             artifact_payload = json.loads(Path(summary.artifact_path).read_text())
-            hf_checkpoint_path = artifact_payload.get("hf_checkpoint_path")
-            if hf_checkpoint_path:
-                payload["hf_checkpoint_path"] = hf_checkpoint_path
-                payload["hf_checkpoint_exists"] = Path(hf_checkpoint_path).exists()
-                payload["hf_checkpoint_bytes"] = artifact_payload.get("hf_checkpoint_bytes")
-                payload["hf_weight_count"] = artifact_payload.get("hf_weight_count")
+            payload["artifact_format"] = artifact_payload.get("artifact_format")
+            for key in (
+                "hf_checkpoint_path",
+                "hf_adapter_path",
+                "hf_weights_path",
+                "hf_weights_index_path",
+                "hf_adapter_config_path",
+                "hf_adapter_weights_path",
+                "hf_checkpoint_bytes",
+                "hf_weight_count",
+                "hf_weight_format",
+            ):
+                if key in artifact_payload:
+                    payload[key] = artifact_payload[key]
+            for key in (
+                "hf_checkpoint_path",
+                "hf_adapter_path",
+                "hf_weights_path",
+                "hf_weights_index_path",
+                "hf_adapter_config_path",
+                "hf_adapter_weights_path",
+            ):
+                if key in payload:
+                    payload[f"{key}_exists"] = Path(payload[key]).exists()
         return _json_safe(payload)
     finally:
         if client is not None:
@@ -317,6 +382,8 @@ def run_bridge_remote(
     dataset_path: str,
     artifact_root: str,
     base_model: str,
+    tuning: str,
+    lora_rank: int,
     max_steps: int,
     save_every: int,
     learning_rate: float,
@@ -329,6 +396,8 @@ def run_bridge_remote(
             dataset_path=dataset_path,
             artifact_root=artifact_root,
             base_model=base_model,
+            tuning=tuning,
+            lora_rank=lora_rank,
             max_steps=max_steps,
             save_every=save_every,
             learning_rate=learning_rate,
@@ -345,6 +414,8 @@ def main(
     dataset_path: str = str(REMOTE_ROOT / "examples" / "tiny_sft.jsonl"),
     artifact_root: str = "/tmp/ganker-sft",
     base_model: str = "Qwen/Qwen3-0.6B",
+    tuning: str = "full",
+    lora_rank: int = 8,
     max_steps: int = 1,
     save_every: int = 0,
     learning_rate: float = 1e-4,
@@ -362,6 +433,8 @@ def main(
             dataset_path,
             artifact_root,
             base_model,
+            tuning,
+            lora_rank,
             max_steps,
             save_every,
             learning_rate,
