@@ -1,201 +1,333 @@
-# RFC 0007: Distributed Monarch Orchestration
+# RFC 0007: Remote TCP Access To A Modal-Hosted Monarch Mesh
 
 Status: Draft
 
 ## Summary
 
-Move Ganker from a single local Monarch proc mesh to a distributed Monarch deployment where proxy, training, rollout, and telemetry can run on separate proc meshes and, eventually, separate hosts.
+The next milestone should not be multinode training yet. For now, assume Ganker runs on a single Modal node with one local Monarch mesh. The important change is that the client is no longer in the same Python process as the mesh. A remote client should be able to reach the proxy over TCP through a stable Ganker transport.
 
-The public client API should stay stable:
+The public API remains:
 
 ```text
 ServiceClient / TrainingClient / SamplingClient
         |
         v
 ProxyTransport
-        |
-        v
-ProxyActor
 ```
 
-The implementation change is underneath `ProxyTransport`: local tests can keep using `ServiceClient.local(...)`, while distributed runs use a deployment controller that starts or attaches to named Monarch host/proc meshes and exposes a proxy endpoint to the client.
+The new work is a TCP transport and a Modal-hosted TCP proxy server:
+
+```text
+remote client process
+        |
+        | framed TCP request/response
+        v
+TcpProxyTransport
+        |
+        v
+ProxyTcpServer  (inside Modal worker)
+        |
+        | Monarch actor calls
+        v
+ProxyActor -> TrainingActor / RolloutActor / TelemetryActor
+```
+
+This gets us out of the current all-local shape without requiring multi-host Monarch placement, external gRPC, or distributed Megatron ranks.
 
 ## Current State
 
-Today `start_local_monarch_mesh(...)` does everything on one local process mesh:
+Today `ServiceClient.local(...)` owns the mesh and the client gets a direct in-process Monarch actor handle:
 
 ```text
+client process
+  |
+  v
+ServiceClient.local(...)
+  |
+  v
+start_local_monarch_mesh(...)
+  |
+  v
 this_host().spawn_procs(name="ganker_local")
-        |
-        +-- TrainingActor
-        +-- RolloutActor
-        +-- TelemetryActor
-        +-- ProxyActor
+  |
+  +-- TrainingActor
+  +-- RolloutActor
+  +-- TelemetryActor
+  +-- ProxyActor
+  |
+  v
+MonarchProxyTransport(proxy_actor_handle)
 ```
 
-This is useful for local tests, but it hides three production concerns:
-
-- proxy/telemetry should not share lifecycle with GPU-heavy trainer processes;
-- rollout and training will have different images, GPU requirements, and restart behavior;
-- distributed Megatron needs collective calls across multiple trainer ranks, not `.choose(...)` to one actor.
+That is good for local tests, but it does not prove that a separate client can call into a running mesh. It also makes the Modal examples look more local than the production shape we want.
 
 ## Goals
 
-- Keep public callers off Monarch internals.
-- Add a controller/orchestrator layer that owns deployment lifecycle.
-- Allow proxy, telemetry, training, and rollout actors to live on separate Monarch proc meshes.
-- Support a local distributed simulation without GPUs or Megatron.
-- Support a Modal distributed smoke where at least proxy and training are not in the same proc mesh/container.
-- Define the path from single-rank Bridge training to multi-rank Megatron training.
-- Keep fake backend tests lightweight and deterministic.
+- Run the Ganker actor mesh inside one Modal function/container.
+- Expose the `ProxyActor` through a TCP server that lives inside that Modal worker.
+- Add a `TcpProxyTransport` so `ServiceClient` can talk to the proxy without Monarch actor handles.
+- Keep request/response contracts as the existing dataclasses.
+- Keep local unit tests CPU-only and independent of Modal, CUDA, Megatron, SGLang, and model downloads.
+- Add lightweight integration tests for the TCP transport using fake backends.
+- Add a Modal smoke where a separate client connects over TCP to the server and runs the existing public SFT flow.
 
 ## Non-Goals
 
-- Do not replace Monarch with gRPC internally.
-- Do not require every local test to start a distributed deployment.
-- Do not solve autoscaling, queueing, or multi-tenant scheduling.
-- Do not implement SGLang multi-node rollout in the first distributed milestone.
-- Do not expose Megatron rank handles or Monarch actor handles in the user-facing API.
-
-## Terminology
-
-```text
-client
-  User code calling ServiceClient.
-
-controller
-  Deployment owner. Allocates/attaches host meshes, spawns proc meshes,
-  wires actor handles, records deployment metadata, and shuts things down.
-  The controller is not the ProxyActor.
-
-proxy
-  Client-facing request router. Owns no model state.
-
-training coordinator
-  Single actor that receives Ganker training requests from ProxyActor and
-  coordinates one or more trainer worker ranks.
-
-trainer workers
-  Rank actors that own Megatron model chunks, distributed process groups,
-  optimizer state, and checkpoint/export collectives.
-
-rollout
-  Inference actor or actor mesh. Eventually owns SGLang runtime state.
-```
+- Do not implement multi-node Megatron yet.
+- Do not split proxy/training/rollout/telemetry across Modal containers yet.
+- Do not require users to speak Monarch.
+- Do not introduce gRPC unless we later need a standardized external wire protocol.
+- Do not solve public internet exposure policy in this RFC. The first smoke can assume the TCP endpoint is reachable from the test client environment.
 
 ## Target Architecture
 
 ```text
-                 +----------------------+
-user code -----> | ServiceClient        |
-                 | ProxyTransport       |
-                 +----------+-----------+
-                            |
-                            v
-                 +----------------------+
-                 | ProxyActor           |  proxy proc mesh
-                 +----+------------+----+
-                      |            |
-          +-----------+            +----------------+
-          v                                         v
-+--------------------------+             +----------------------+
-| TrainingCoordinatorActor |             | RolloutActor         |
-| trainer control mesh     |             | rollout proc mesh    |
-+------------+-------------+             +----------+-----------+
-             |                                      |
-             v                                      v
-  +----------------------+                 +------------------+
-  | TrainerWorkerActor[] |                 | SGLang backend   |
-  | trainer rank mesh    |                 | or fake backend  |
-  +----------+-----------+                 +------------------+
-             |
-             v
-  +----------------------+
-  | Megatron Bridge/Core |
-  | distributed ranks    |
-  +----------------------+
+                outside mesh boundary
+remote python client
+        |
+        | ServiceClient.connect_tcp(host, port)
+        v
++----------------------+
+| TcpProxyTransport    |
++----------+-----------+
+           |
+           | length-prefixed TCP frames
+           v
+========================================================
+Modal worker / single node
 
 +----------------------+
-| TelemetryActor       | telemetry proc mesh
+| ProxyTcpServer       |
+| - listens on TCP     |
+| - decodes requests   |
+| - calls ProxyActor   |
++----------+-----------+
+           |
+           | MonarchProxyTransport or direct actor calls
+           v
 +----------------------+
+| ProxyActor           |
++----+------------+----+
+     |            |
+     v            v
++-------------+  +-------------+  +----------------+
+|TrainingActor|  |RolloutActor |  |TelemetryActor  |
++------+------+  +------+------+  +--------+-------+
+       |                |                  |
+       v                v                  v
+ Megatron/fake      SGLang/fake      telemetry ledger
 
-+----------------------+
-| Artifact store       | shared filesystem / Modal Volume / object store
-+----------------------+
+Shared artifact root: local path or Modal Volume
 ```
 
-## Deployment Spec
+The internal Monarch mesh can still be created with `this_host().spawn_procs(name="ganker_local")` for the first implementation. The milestone is remote reachability, not actor placement.
 
-Add a first-class deployment specification to `ganker.orchestration`.
+## TCP Wire Contract
 
-Example shape:
+Use a small framed protocol over TCP:
+
+```text
+uint32_be frame_length
+json payload bytes
+```
+
+Initial payload shape:
+
+```json
+{
+  "request_id": "req-123",
+  "method": "forward_backward",
+  "body": {
+    "...": "serialized request dataclass"
+  }
+}
+```
+
+Response shape:
+
+```json
+{
+  "request_id": "req-123",
+  "ok": true,
+  "body": {
+    "...": "serialized response dataclass"
+  }
+}
+```
+
+Error response:
+
+```json
+{
+  "request_id": "req-123",
+  "ok": false,
+  "error_type": "InvalidRequestError",
+  "message": "..."
+}
+```
+
+JSON is enough for the first milestone because the existing contract payloads are small and dataclass-shaped. We can move to msgpack or protobuf only if payload size or multi-language clients require it.
+
+## Serialization
+
+Add explicit serialization helpers for the request/response dataclasses:
+
+```text
+ganker.wire
+  encode_request(method, dataclass) -> dict
+  decode_request(method, dict) -> dataclass
+  encode_response(method, dataclass) -> dict
+  decode_response(method, dict) -> dataclass
+```
+
+The serializer should be explicit rather than blindly pickling objects over the network. Pickle is acceptable inside Monarch actor internals, but the remote TCP boundary should be inspectable and stable.
+
+The first supported methods should match `ProxyTransport`:
+
+```text
+create_training_run
+forward_backward
+optim_step
+save_weights
+refresh_weights
+sample
+get_telemetry_summary
+```
+
+## Client API
+
+Add a connection constructor without changing training-loop code:
 
 ```python
-DistributedMeshSpec(
-    artifact_root="/mnt/ganker-artifacts",
-    transport="tcp",
-    proxy=ProcMeshSpec(name="ganker_proxy", hosts=1, procs_per_host=1),
-    telemetry=ProcMeshSpec(name="ganker_telemetry", hosts=1, procs_per_host=1),
-    training=ProcMeshSpec(name="ganker_training", hosts=1, gpus_per_host=1),
-    rollout=ProcMeshSpec(name="ganker_rollout", hosts=1, gpus_per_host=1),
+client = ServiceClient.connect_tcp("127.0.0.1", 38211, timeout=120)
+training = client.create_training_client(
+    base_model="Qwen/Qwen3-0.6B",
+    tuning="lora",
+    rank=8,
+)
+```
+
+Implementation:
+
+```text
+ServiceClient.connect_tcp(...)
+  -> TcpProxyTransport(host, port, timeout)
+  -> ServiceClient(_transport=transport)
+```
+
+`ServiceClient.local(...)` remains unchanged for local tests and fast development.
+
+## Server API
+
+Add a server object that owns a local mesh and a TCP listener:
+
+```python
+server = start_tcp_proxy_server(
+    host="0.0.0.0",
+    port=0,
+    artifact_root=Path("/tmp/ganker-artifacts"),
     training_backend="megatron",
     training_backend_config={...},
     inference_backend="fake",
 )
+print(server.bound_host, server.bound_port)
+server.serve_forever()
 ```
 
-The first implementation can map this onto one physical host with separate proc meshes. The important contract is that actors are no longer spawned into the same `ganker_local` proc mesh. Modal can then map each proc mesh to separate containers or host allocations.
+Server responsibilities:
 
-## Controller API
+- start the local Monarch mesh;
+- keep the proxy actor handle private;
+- accept TCP connections;
+- decode one framed request at a time;
+- route to the matching proxy endpoint;
+- encode the typed response;
+- return typed errors;
+- shut down the mesh when the server stops.
 
-Add a controller object rather than growing `ServiceClient.local(...)`:
+Concurrency can be simple initially: one request per connection, or sequential requests on a connection guarded by a per-connection loop. Parallel request handling should wait until the stateful training lifecycle needs it.
 
-```python
-deployment = start_distributed_monarch_deployment(spec)
-client = deployment.client(timeout=120)
-...
-deployment.stop()
-```
+## Modal Shape
 
-The deployment object should own:
-
-- host mesh handles;
-- proc mesh handles;
-- actor handles;
-- readiness futures;
-- shutdown order;
-- deployment metadata for debugging.
-
-`ServiceClient.local(...)` remains a small local-test helper. Distributed callers either receive a `ServiceClient` from the deployment object or connect through a non-Monarch external `ProxyTransport`.
-
-## Client Boundary
-
-The client should still not speak Monarch directly.
-
-For Python smoke tests inside the same controller process:
+Add a new Modal app rather than changing `modal_apps/sft.py`:
 
 ```text
-DistributedGankerDeployment.client()
-  -> ServiceClient(MonarchProxyTransport(proxy_actor))
+modal_apps/remote_mesh.py
 ```
 
-For callers outside the Monarch controller process, add an external transport adapter:
+Initial modes:
+
+1. `--mode tcp-smoke-fake`
+   - Starts a local Monarch mesh in a Modal worker.
+   - Starts `ProxyTcpServer` on localhost.
+   - Starts a separate client inside the same Modal function and connects over TCP.
+   - Uses fake backends.
+   - Proves the remote transport path without GPU dependencies.
+
+2. `--mode tcp-smoke-qwen-lora`
+   - Uses the controlled Bridge image from RFC 0006.
+   - Starts the same TCP server.
+   - Starts a separate client inside the same Modal function and connects over TCP.
+   - Runs one Qwen LoRA SFT step.
+   - Exports a PEFT adapter safetensors artifact.
+
+3. `--mode serve`
+   - Starts the TCP server and reports host/port metadata.
+   - Keeps the Modal worker alive for manual remote testing.
+   - This mode can assume the caller has a way to reach the Modal worker over TCP, such as a Modal-supported tunnel, private network, or in-cluster client.
+
+The first two modes are enough to prove the Ganker TCP boundary. They do not require Modal multinode clustering.
+
+## Local Testing
+
+Unit tests:
+
+- frame encode/decode;
+- request/response dataclass serialization;
+- `TcpProxyTransport` maps each method to a framed request;
+- server dispatch maps each method to the correct proxy endpoint;
+- remote errors become appropriate client exceptions.
+
+Integration tests:
+
+- start a local Monarch mesh and TCP server on `127.0.0.1:0`;
+- connect with `ServiceClient.connect_tcp(...)`;
+- run the same flow as `test_full_singleton_flow_through_public_client`;
+- assert telemetry, artifacts, and sample output match the in-process transport test.
+
+The default `uv run pytest` can include this TCP integration test because it uses fake backends only.
+
+## Artifact Store
+
+Single-node Modal can keep using a filesystem path:
 
 ```text
-ServiceClient.connect(...)
-  -> HttpProxyTransport / ModalProxyTransport
-  -> ProxyActor
+/tmp/ganker-artifacts
 ```
 
-This keeps Monarch an internal orchestration layer while allowing a stable public API for users.
+For any served/manual mode that should outlive one function invocation, mount a Modal Volume at a stable path:
 
-## Training Distribution
+```text
+/mnt/ganker-artifacts
+```
 
-There are two separate milestones.
+The TCP transport does not change artifact semantics. `save_weights` still returns a `WeightArtifact` containing manifest and payload paths meaningful to the server environment. A later RFC should define downloadable artifacts for clients outside the Modal filesystem.
 
-### Milestone A: Distributed Actor Placement
+## Security
 
-Keep a single-rank training backend, but place actors on separate proc meshes:
+The first milestone can be private/test-only, but the TCP server should still avoid obvious footguns:
+
+- no pickle over the TCP boundary;
+- optional shared bearer token in request metadata;
+- maximum frame size;
+- per-request timeout;
+- structured error responses without arbitrary tracebacks by default.
+
+Production authentication, TLS, and public endpoint policy are out of scope for this milestone.
+
+## Later: Separate Actor Meshes
+
+Once remote TCP access works, we can split actors across proc meshes on the same host:
 
 ```text
 proxy proc mesh      -> ProxyActor
@@ -204,19 +336,13 @@ training proc mesh   -> TrainingActor
 rollout proc mesh    -> RolloutActor
 ```
 
-This validates:
+That validates lifecycle separation without changing the remote TCP client.
 
-- deployment spec parsing;
-- actor handle wiring across proc meshes;
-- readiness and shutdown across proc meshes;
-- shared artifact root;
-- existing public `ServiceClient` flow.
+## Later: Multi-Rank Megatron
 
-It does not validate Megatron multi-rank behavior yet.
+Multirank training should be a separate milestone after TCP access works.
 
-### Milestone B: Distributed Megatron Ranks
-
-Replace direct `ProxyActor -> TrainingActor` routing with:
+The eventual shape is:
 
 ```text
 ProxyActor
@@ -226,200 +352,33 @@ ProxyActor
        -> ...
 ```
 
-The coordinator is the only training actor that the proxy knows about. It exposes the current training endpoints:
-
-```text
-create_training_run
-forward_backward
-optim_step
-save_weights
-shutdown
-```
-
-Each endpoint becomes a collective operation across trainer workers:
-
-```text
-create_training_run
-  coordinator validates request
-  coordinator broadcasts init to all workers
-  workers initialize Megatron distributed state
-  rank 0 returns TrainingRun metadata
-
-forward_backward
-  coordinator sends batch or batch shards to workers
-  all workers enter the same Megatron schedule
-  rank 0 returns reduced loss and usage
-
-optim_step
-  all workers step optimizer
-  rank 0 returns optimizer_step/checkpoint_version
-
-save_weights
-  all workers enter export/checkpoint collectives
-  rank 0 writes artifact manifest/payload
-  coordinator returns WeightArtifact
-```
-
-This avoids `.choose(...)` accidentally sending a collective operation to only one rank.
-
-## Megatron Runtime Changes
-
-The current `InstalledMegatronBridgeRuntime` assumes `WORLD_SIZE=1` and initializes distributed state inside one actor process. Distributed training needs a runtime config that comes from the trainer worker mesh:
-
-```text
-rank
-world_size
-local_rank
-master_addr
-master_port
-tensor_model_parallel_size
-pipeline_model_parallel_size
-data_parallel_size
-```
-
-The worker runtime should not guess these values from process-local defaults. The coordinator should provide a rank assignment object to each worker.
-
-Initial distributed constraints:
-
-- one active run per trainer worker mesh;
-- tensor parallel and pipeline parallel default to 1;
-- data parallel can be the first multi-rank mode;
-- rank 0 writes Ganker artifact metadata;
-- all ranks participate in Bridge checkpoint/export calls when required.
-
-## Artifact Store
-
-Distributed actors need a shared artifact store.
-
-Local simulation:
-
-```text
-temporary directory visible to all local processes
-```
-
-Modal:
-
-```text
-Modal Volume mounted at the same path in proxy/training/rollout containers
-```
-
-Later:
-
-```text
-object store-backed ArtifactStore
-```
-
-Artifact writes must remain atomic from the client perspective:
-
-- checkpoint/export finishes before manifest write;
-- manifest write happens on rank 0;
-- rollout refresh reads only completed manifests;
-- failed checkpoint attempts do not advance latest pointers.
-
-## Modal Shape
-
-Current `modal_apps/sft.py` runs the whole Ganker mesh inside one Modal function. The distributed milestone should add a new app rather than mutate the existing smoke:
-
-```text
-modal_apps/distributed_sft.py
-```
-
-Target stages:
-
-1. `--mode fake-distributed`
-   - CPU image.
-   - separate proxy/training/rollout/telemetry proc meshes.
-   - fake backends.
-   - proves lifecycle and public API.
-
-2. `--mode qwen-single-rank-distributed`
-   - controlled Bridge image from RFC 0006.
-   - proxy/telemetry separated from a single-rank training mesh.
-   - runs Qwen full or LoRA one-step smoke.
-
-3. `--mode qwen-data-parallel`
-   - controlled Bridge image.
-   - `TrainerWorkerActor[]` rank mesh.
-   - data-parallel Megatron run across two GPUs.
-   - one-step LoRA smoke first, full tuning second.
-
-## Testing Plan
-
-Unit tests:
-
-- `DistributedMeshSpec` validation.
-- controller spawn plan generation.
-- coordinator state machine with fake worker handles.
-- rank assignment generation.
-- artifact write/read behavior under rank-0-only writes.
-
-Local integration tests:
-
-- separate local proc meshes with fake backends;
-- public `ServiceClient` end-to-end flow;
-- shutdown order and idempotent cleanup;
-- failure injection where one worker fails and coordinator marks run failed.
-
-Modal smoke tests:
-
-- fake distributed actor placement;
-- Qwen LoRA single-rank distributed placement;
-- Qwen LoRA two-rank data parallel if the Modal GPU shape supports it.
-
-Default `uv run pytest` must remain CPU-only and must not require Modal, CUDA, Megatron, SGLang, or model downloads.
-
-## Rollout Distribution
-
-Rollout should follow training only after the training coordinator design is stable.
-
-First rollout target:
-
-```text
-ProxyActor -> RolloutActor on separate proc mesh -> fake backend
-```
-
-Second rollout target:
-
-```text
-ProxyActor -> RolloutActor on GPU proc mesh -> SGLang backend
-```
-
-The rollout actor should continue consuming `WeightArtifact` metadata. It should not know about trainer worker ranks.
-
-## Failure Semantics
-
-- Controller startup fails if any actor mesh does not become ready before timeout.
-- Proxy should reject requests until training, rollout, and telemetry handles are ready.
-- Coordinator marks the run failed if any trainer rank fails during a collective operation.
-- `save_weights` failure leaves the previous artifact latest pointer intact.
-- Shutdown should try actor-level backend cleanup before stopping proc meshes.
-- Modal smoke should surface worker logs and deployment metadata in the returned payload.
+The coordinator must make `create_training_run`, `forward_backward`, `optim_step`, and `save_weights` collective operations across all trainer ranks. That work should not block the single-node remote TCP milestone.
 
 ## Implementation Plan
 
-1. Add `ProcMeshSpec`, `DistributedMeshSpec`, and `DistributedGankerDeployment`.
-2. Implement `start_distributed_monarch_deployment(...)` for separate proc meshes on the current host.
-3. Add local integration tests with fake backends and separate proc mesh names.
-4. Add `modal_apps/distributed_sft.py --mode fake-distributed`.
-5. Split training into `TrainingCoordinatorActor` and fake `TrainerWorkerActor` mesh.
-6. Add coordinator unit tests and failure injection.
-7. Move Megatron Bridge runtime into trainer workers with explicit rank assignment.
-8. Add Modal Qwen LoRA single-rank distributed smoke.
-9. Add Modal Qwen LoRA two-rank data-parallel smoke.
+1. Add `ganker.wire` serialization helpers for current `ProxyTransport` methods.
+2. Add TCP frame read/write helpers with frame-size limits.
+3. Add `TcpProxyTransport`.
+4. Add `ProxyTcpServer` that wraps a private local Monarch mesh.
+5. Add `ServiceClient.connect_tcp(...)`.
+6. Add fake-backend local TCP integration tests.
+7. Add `modal_apps/remote_mesh.py --mode tcp-smoke-fake`.
+8. Add `modal_apps/remote_mesh.py --mode tcp-smoke-qwen-lora`.
+9. Add optional bearer-token support.
+10. Add served/manual mode once the smoke path is stable.
 
 ## Acceptance Criteria
 
-- Existing `ServiceClient.local(...)` tests still pass.
-- A new local integration test proves proxy/training/rollout/telemetry are spawned on different proc meshes.
-- Modal fake distributed smoke runs through the public client API.
-- Modal Qwen LoRA smoke runs with proxy and training outside a single local mesh.
-- Multi-rank training smoke runs one LoRA step and exports a PEFT adapter artifact.
-- No user-facing API requires Monarch actor handles.
+- Existing `ServiceClient.local(...)` behavior is unchanged.
+- A local TCP integration test drives the full public client flow through `ServiceClient.connect_tcp(...)`.
+- Modal fake TCP smoke passes without GPU dependencies.
+- Modal Qwen LoRA TCP smoke passes and exports `hf-lora-adapter`.
+- No user-facing API exposes Monarch actor handles.
+- No TCP payload uses pickle.
 
 ## Open Questions
 
-- Which Monarch host acquisition path should be the stable Modal implementation: `hosts_from_config(...)`, explicit worker-loop containers, or a Modal-specific controller wrapper?
-- Should the first multi-rank mode be pure data parallel, or should tensor parallel be validated immediately because Qwen/Megatron production will need it?
-- Should external users call a Modal web endpoint, an HTTP proxy, or a Python-only Modal function wrapper for the first non-local API?
-- How much of the trainer batch should the coordinator broadcast versus shard before reaching worker ranks?
-- Do we need a separate artifact-store abstraction before distributed rollout, or is a shared Modal Volume enough for the next milestone?
+- Should the first TCP wire format be JSON only, or JSON headers plus binary tensor payloads for future larger batches?
+- Should served Modal mode use raw TCP reachability, a Modal tunnel, or a thin HTTP wrapper around the same `ProxyTransport`?
+- Should artifacts be downloadable through the TCP server, or should artifact download wait for an object-store-backed artifact layer?
+- Do we need streaming/bidirectional requests soon, or are request/response frames enough for the current training API?
