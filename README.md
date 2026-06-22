@@ -74,6 +74,7 @@ source ~/.codex/modal.env
 modal run modal_apps/megatron_smoke.py --mode env
 modal run modal_apps/megatron_smoke.py --mode pytest-cpu
 modal run modal_apps/megatron_smoke.py --mode megatron
+modal run modal_apps/megatron_smoke.py --mode ganker
 ```
 
 The `env` mode reports CUDA, torch, Megatron-Core, and Megatron Bridge
@@ -81,6 +82,8 @@ availability. The `pytest-cpu` mode runs the repo's CPU suite inside the Modal
 image. The `megatron` mode runs a tiny synthetic GPT training step using
 Megatron-Core's `get_forward_backward_func()`, takes one optimizer step, and
 writes a checkpoint under `/tmp/ganker-megatron-smoke` in the Modal container.
+The `ganker` mode runs the same kind of tiny Megatron-Core training step
+through the public `ServiceClient -> ProxyActor -> TrainingActor` path.
 
 Useful overrides:
 
@@ -90,10 +93,8 @@ GANKER_MODAL_BASE_IMAGE=nvcr.io/nvidia/pytorch:<tag> modal run modal_apps/megatr
 modal run modal_apps/megatron_smoke.py --mode megatron --num-steps 2 --sequence-length 32
 ```
 
-The current `--mode ganker` path is a boundary probe: it verifies that the
-public client can reach the Megatron backend, but it will report `wired: false`
-until `InProcessMegatronRuntime` is implemented behind `MegatronTrainingBackend`.
 The Modal app intentionally does not install Megatron Bridge yet; the direct
-real-training smoke uses Megatron-Core only.
+real-training smoke uses Megatron-Core only. Megatron Bridge is still needed
+later for Hugging Face conversion, production model providers, and export.
 
 See `architecture/` for the local orchestration diagrams.

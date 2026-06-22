@@ -1,11 +1,15 @@
-"""Import-isolated Megatron Bridge training backend adapter."""
+"""Import-isolated Megatron training backend adapters."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import partial
 from itertools import count
 import importlib
+import os
+from pathlib import Path
+import socket
 from threading import RLock
 from typing import Any, Protocol
 
@@ -198,6 +202,149 @@ class InstalledMegatronBridgeRuntime:
         _ = handle
 
 
+class InProcessMegatronCoreRuntime:
+    """Tiny in-process Megatron-Core runtime for Modal smoke testing.
+
+    This is not the production Bridge/HF conversion path. It exists to prove
+    the Ganker lifecycle against Megatron-Core's real forward/backward schedule
+    without installing Megatron Bridge.
+    """
+
+    def create_run(
+        self,
+        *,
+        base_model: str,
+        tuning_mode: TuningMode,
+        lora_rank: int,
+        config: MegatronBackendConfig,
+    ) -> MegatronRunHandle:
+        _ = base_model, tuning_mode, lora_rank
+        torch = _import_torch()
+        self._validate_config(config)
+        device = _resolve_device(config.tensor_device, torch)
+        _initialize_distributed(
+            device=device,
+            tensor_parallel=config.tensor_model_parallel_size,
+            pipeline_parallel=config.pipeline_model_parallel_size,
+        )
+        torch.manual_seed(config.seed)
+        if device == "cuda":
+            from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+            model_parallel_cuda_manual_seed(config.seed)
+
+        model = _build_tiny_gpt_model(config).to(torch.device(device))
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+        from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+
+        return MegatronRunHandle(
+            bridge=None,
+            provider={"runtime": "megatron-core"},
+            model=model,
+            optimizer=optimizer,
+            forward_backward_schedule=get_forward_backward_func(),
+            config={"device": device},
+        )
+
+    def forward_backward(
+        self,
+        *,
+        handle: MegatronRunHandle,
+        batch: MegatronTensorBatch,
+        loss_fn: str,
+        loss_fn_config: dict[str, float],
+    ) -> ForwardBackwardOutput:
+        _ = loss_fn_config
+        if loss_fn != "cross_entropy":
+            raise InvalidRequestError(f"unsupported Megatron-Core loss_fn: {loss_fn}")
+        if handle.model is None or handle.optimizer is None or handle.forward_backward_schedule is None:
+            raise BackendUnavailableError("Megatron-Core runtime handle is not initialized")
+
+        sequence_length = int(batch.input_ids.shape[1])
+        micro_batch_size = int(batch.input_ids.shape[0])
+        handle.optimizer.zero_grad(set_to_none=True)
+        losses_reduced = handle.forward_backward_schedule(
+            forward_step_func=_core_forward_step_func,
+            data_iterator=iter([_core_runtime_batch(batch)]),
+            model=handle.model,
+            num_microbatches=1,
+            seq_length=sequence_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=sequence_length,
+            forward_only=False,
+        )
+        loss = _extract_loss(losses_reduced)
+        return ForwardBackwardOutput(loss=loss, metrics={"loss": loss})
+
+    def optim_step(
+        self,
+        *,
+        handle: MegatronRunHandle,
+        params: AdamParams,
+    ) -> None:
+        if handle.optimizer is None:
+            raise BackendUnavailableError("Megatron-Core optimizer is not initialized")
+        for group in handle.optimizer.param_groups:
+            group["lr"] = params.learning_rate
+        handle.optimizer.step()
+        handle.optimizer.zero_grad(set_to_none=True)
+
+    def save_weights(
+        self,
+        *,
+        handle: MegatronRunHandle,
+        run_id: str,
+        checkpoint_version: int,
+        kind: ArtifactKind,
+    ) -> dict[str, Any]:
+        if handle.model is None:
+            raise BackendUnavailableError("Megatron-Core model is not initialized")
+        torch = _import_torch()
+        checkpoint_dir = Path(os.getenv("GANKER_ARTIFACT_ROOT", "/tmp/ganker-artifacts"))
+        checkpoint_dir = checkpoint_dir / "megatron-core" / run_id
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = checkpoint_dir / f"checkpoint-{checkpoint_version:06d}.pt"
+        torch.save(handle.model.state_dict(), checkpoint_path)
+        return {
+            "backend": "megatron-core",
+            "runtime": "megatron-core",
+            "artifact_format": "megatron-core-torch-state-dict",
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_bytes": checkpoint_path.stat().st_size,
+            "kind": kind.name,
+        }
+
+    def shutdown(self, *, handle: MegatronRunHandle) -> None:
+        _ = handle
+        _destroy_distributed()
+
+    def _validate_config(self, config: MegatronBackendConfig) -> None:
+        if config.tensor_model_parallel_size != 1:
+            raise InvalidRequestError("core runtime smoke supports tensor_model_parallel_size=1")
+        if config.pipeline_model_parallel_size != 1:
+            raise InvalidRequestError("core runtime smoke supports pipeline_model_parallel_size=1")
+        if config.micro_batch_size <= 0:
+            raise InvalidRequestError("micro_batch_size must be positive")
+        if config.sequence_length <= 0:
+            raise InvalidRequestError("sequence_length must be positive")
+        if config.hidden_size <= 0:
+            raise InvalidRequestError("hidden_size must be positive")
+        if config.num_layers <= 0:
+            raise InvalidRequestError("num_layers must be positive")
+        if config.num_attention_heads <= 0:
+            raise InvalidRequestError("num_attention_heads must be positive")
+        if config.hidden_size % config.num_attention_heads:
+            raise InvalidRequestError("hidden_size must be divisible by num_attention_heads")
+
+
+def _build_runtime(config: MegatronBackendConfig) -> MegatronRuntime:
+    if config.runtime_kind == "bridge":
+        return InstalledMegatronBridgeRuntime.from_installed()
+    if config.runtime_kind == "core":
+        return InProcessMegatronCoreRuntime()
+    raise InvalidRequestError(f"unknown Megatron runtime_kind: {config.runtime_kind}")
+
+
 def is_megatron_bridge_available() -> bool:
     try:
         importlib.import_module("megatron.bridge")
@@ -274,6 +421,143 @@ def _required_tensor_values(datum: Datum, name: str, datum_index: int) -> list[i
     return tensor.tolist()
 
 
+def _import_torch():
+    try:
+        import torch
+    except ImportError as exc:
+        raise BackendUnavailableError("torch is required for Megatron-Core runtime") from exc
+    return torch
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _resolve_device(requested: str, torch) -> str:
+    if requested == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise BackendUnavailableError("CUDA was requested but torch.cuda.is_available() is false")
+    if requested not in ("cpu", "cuda"):
+        raise InvalidRequestError(f"unsupported tensor_device: {requested}")
+    return requested
+
+
+def _initialize_distributed(*, device: str, tensor_parallel: int, pipeline_parallel: int) -> None:
+    torch = _import_torch()
+    import torch.distributed as dist
+    from megatron.core import parallel_state
+
+    rank = int(os.environ.setdefault("RANK", "0"))
+    world_size = int(os.environ.setdefault("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.setdefault("LOCAL_RANK", str(rank)))
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", str(_free_port()))
+
+    if device == "cuda":
+        torch.cuda.set_device(local_rank)
+        backend = "nccl"
+    else:
+        backend = "gloo"
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    if not parallel_state.model_parallel_is_initialized():
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=tensor_parallel,
+            pipeline_model_parallel_size=pipeline_parallel,
+        )
+
+
+def _destroy_distributed() -> None:
+    try:
+        import torch.distributed as dist
+        from megatron.core import parallel_state
+    except Exception:
+        return
+
+    try:
+        if parallel_state.model_parallel_is_initialized():
+            parallel_state.destroy_model_parallel()
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _build_tiny_gpt_model(config: MegatronBackendConfig):
+    torch = _import_torch()
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    transformer_config = TransformerConfig(
+        num_layers=config.num_layers,
+        hidden_size=config.hidden_size,
+        num_attention_heads=config.num_attention_heads,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.float32,
+    )
+    return GPTModel(
+        config=transformer_config,
+        transformer_layer_spec=get_gpt_layer_local_spec(),
+        vocab_size=config.vocab_size,
+        max_sequence_length=config.sequence_length,
+    )
+
+
+def _core_runtime_batch(batch: MegatronTensorBatch) -> dict[str, Any]:
+    torch = _import_torch()
+    micro_batch_size, sequence_length = batch.input_ids.shape
+    device = batch.input_ids.device
+    position_ids = torch.arange(sequence_length, device=device).unsqueeze(0)
+    position_ids = position_ids.expand(micro_batch_size, -1)
+    attention_mask = torch.tril(
+        torch.ones((sequence_length, sequence_length), dtype=torch.bool, device=device)
+    )
+    attention_mask = ~attention_mask.view(1, 1, sequence_length, sequence_length)
+    return {
+        "tokens": batch.input_ids,
+        "labels": batch.target_tokens,
+        "position_ids": position_ids,
+        "attention_mask": attention_mask,
+        "loss_mask": batch.weights,
+    }
+
+
+def _core_forward_step_func(data_iterator, model):
+    torch = _import_torch()
+
+    def loss_func(loss_mask, output_tensor):
+        losses = output_tensor.float()
+        loss_mask = loss_mask.reshape(-1).float()
+        loss = torch.sum(losses.reshape(-1) * loss_mask) / loss_mask.sum()
+        return loss, {"lm loss": loss.detach()}
+
+    data = next(data_iterator)
+    output_tensor = model(
+        data["tokens"],
+        data["position_ids"],
+        data["attention_mask"],
+        labels=data["labels"],
+    )
+    return output_tensor, partial(loss_func, data["loss_mask"])
+
+
+def _extract_loss(losses_reduced: Any) -> float:
+    if not losses_reduced:
+        return 0.0
+    first = losses_reduced[0]
+    if isinstance(first, dict):
+        value = first.get("lm loss", first.get("loss", 0.0))
+    else:
+        value = first
+    if hasattr(value, "item"):
+        value = value.item()
+    return float(value)
+
+
 class MegatronTrainingBackend:
     """Coordinator for Megatron Bridge training state.
 
@@ -291,7 +575,7 @@ class MegatronTrainingBackend:
     ):
         self._artifact_store = artifact_store
         self._config = config or MegatronBackendConfig()
-        self._runtime = runtime or InstalledMegatronBridgeRuntime.from_installed()
+        self._runtime = runtime or _build_runtime(self._config)
         self._run_counter = count(1)
         self._runs: dict[str, _RunState] = {}
         self._lock = RLock()

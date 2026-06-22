@@ -7,6 +7,7 @@ from ganker.artifacts import FilesystemArtifactStore
 from ganker.backends.factory import build_training_backend
 from ganker.backends.megatron import (
     InstalledMegatronBridgeRuntime,
+    InProcessMegatronCoreRuntime,
     MegatronRunHandle,
     MegatronTrainingBackend,
     datums_to_tensor_batch,
@@ -53,6 +54,37 @@ def test_factory_reports_missing_megatron_bridge(monkeypatch, tmp_path: Path):
 
     with pytest.raises(BackendUnavailableError, match="missing bridge"):
         build_training_backend("megatron", tmp_path)
+
+
+def test_factory_core_runtime_does_not_require_megatron_bridge(tmp_path: Path):
+    backend = build_training_backend(
+        "megatron",
+        tmp_path,
+        config={"runtime_kind": "core", "tensor_device": "cpu"},
+    )
+
+    assert backend.__class__.__name__ == "MegatronTrainingBackend"
+
+
+def test_megatron_backend_rejects_unknown_runtime_kind(tmp_path: Path):
+    with pytest.raises(InvalidRequestError, match="unknown Megatron runtime_kind"):
+        MegatronTrainingBackend(
+            FilesystemArtifactStore(tmp_path),
+            config=MegatronBackendConfig(runtime_kind="bogus"),
+        )
+
+
+def test_core_runtime_validates_tiny_model_config_without_importing_megatron():
+    runtime = InProcessMegatronCoreRuntime()
+
+    with pytest.raises(InvalidRequestError, match="hidden_size must be divisible"):
+        runtime._validate_config(
+            MegatronBackendConfig(
+                runtime_kind="core",
+                hidden_size=30,
+                num_attention_heads=8,
+            )
+        )
 
 
 def test_installed_runtime_maps_config_to_bridge_provider():

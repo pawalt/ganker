@@ -348,10 +348,16 @@ def run_ganker_boundary_probe(args: argparse.Namespace) -> dict[str, Any]:
             Path(args.artifact_root),
             training_backend="megatron",
             training_backend_config={
+                "runtime_kind": "core",
                 "tensor_device": args.device if args.device != "auto" else "cuda",
                 "micro_batch_size": args.micro_batch_size,
                 "global_batch_size": args.micro_batch_size,
                 "sequence_length": args.sequence_length,
+                "vocab_size": args.vocab_size,
+                "hidden_size": args.hidden_size,
+                "num_layers": args.num_layers,
+                "num_attention_heads": args.num_attention_heads,
+                "seed": args.seed,
                 "load_weights": False,
             },
             timeout=60,
@@ -360,7 +366,9 @@ def run_ganker_boundary_probe(args: argparse.Namespace) -> dict[str, Any]:
             base_model=args.base_model,
             rank=args.lora_rank,
         )
-        training.forward_backward(datum, loss_fn="cross_entropy")
+        fb = training.forward_backward(datum, loss_fn="cross_entropy")
+        step = training.optim_step(learning_rate=args.learning_rate)
+        saved = training.save_weights()
     except Exception as exc:
         if client is not None:
             try:
@@ -373,7 +381,7 @@ def run_ganker_boundary_probe(args: argparse.Namespace) -> dict[str, Any]:
             "wired": False,
             "reason": str(exc),
             "close_error": close_error,
-            "note": "The direct Megatron-Core smoke is implemented; the Ganker Megatron runtime is still a stub.",
+            "note": "Ganker attempted the in-process Megatron-Core runtime path.",
         }
     finally:
         if client is not None:
@@ -386,7 +394,11 @@ def run_ganker_boundary_probe(args: argparse.Namespace) -> dict[str, Any]:
         "ok": True,
         "mode": "ganker",
         "wired": True,
-        "note": "Ganker Megatron path completed; this is expected only after InProcessMegatronRuntime is implemented.",
+        "loss": fb.loss,
+        "optimizer_step": step.optimizer_step,
+        "checkpoint_version": step.checkpoint_version,
+        "artifact_path": saved.artifact.payload_path,
+        "note": "Ganker Megatron-Core runtime path completed through the public client.",
     }
 
 
