@@ -1,0 +1,24 @@
+[project]
+name = "ganker"
+version = "0.1.0"
+description = "Local singleton Tinker-style Monarch prototype."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torchmonarch>=0.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
