@@ -152,3 +152,8 @@ Monarch controller
 ```
 
 The local singleton keeps all actors on a small local Monarch process mesh. Production can place trainer and rollout actors on separate meshes while preserving the same endpoint contracts.
+
+The Modal distributed smoke follows that production shape with fake backends:
+worker roles listen on private i6pn addresses, publish endpoint metadata, and
+the controller attaches with Monarch `attach_to_workers`. See
+[distributed-modal.md](/home/ec2-user/projects/ganker/architecture/distributed-modal.md).

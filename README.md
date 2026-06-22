@@ -63,6 +63,20 @@ uv run pytest
 The default suite stays CPU-only and does not require Megatron Bridge, `sglang`,
 CUDA, model weights, or checkpoints.
 
+The controller/proxy/trainer/rollout split can be exercised locally without
+Modal or GPUs:
+
+```python
+from ganker import ServiceClient
+
+with ServiceClient.local_distributed("/tmp/ganker-distributed-artifacts") as client:
+    training_client = client.create_lora_training_client("Qwen/Qwen3-0.6B")
+```
+
+That starts local Monarch worker listeners for trainer and rollout, registers
+their loopback endpoints, and has the controller attach to them with
+`attach_to_workers`.
+
 SGLang backend contract tests also stay CPU-only by injecting fake HTTP/runtime
 objects:
 
@@ -83,6 +97,19 @@ modal run modal_apps/sglang_smoke.py --mode client
 
 That smoke starts SGLang for `Qwen/Qwen3-0.6B`, then samples through
 `ServiceClient.local(..., inference_backend="sglang")`.
+
+Distributed Modal orchestration has two CPU-only smokes:
+
+```bash
+source ~/.codex/modal.env
+uv run modal run modal_apps/distributed_mesh.py --mode tcp-smoke --port 26620
+uv run modal run modal_apps/distributed_mesh.py --mode fake-distributed --port 26600 --controller-port 26610
+```
+
+The first verifies private i6pn TCP between Modal functions. The second verifies
+Monarch `attach_to_workers` over i6pn with separate trainer and rollout worker
+containers. All i6pn roles must be pinned to the same exact region, currently
+`us-east-1`.
 
 Megatron adapter preflight tests run locally without a GPU:
 

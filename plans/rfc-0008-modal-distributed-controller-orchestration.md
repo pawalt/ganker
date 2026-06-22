@@ -12,9 +12,11 @@ The key change is making the controller a first-class service. The proxy remains
 the client-facing gateway, but it should not own topology, readiness, artifact
 versions, or failure policy. The controller owns those concerns.
 
-The distributed control boundary should be gRPC between Modal containers. Monarch
-can still be used inside a role when it helps local actor orchestration, but
-cross-machine role communication should use explicit RPC contracts first.
+The distributed control boundary inside Modal should be Monarch, not a second
+internal protobuf/gRPC layer. External clients still use the existing Ganker
+gRPC API at the proxy boundary, but proxy/controller/trainer orchestration
+should happen through Monarch actor endpoints over i6pn. SGLang remains an HTTP
+backend for sampling.
 
 ```text
 external client
@@ -25,7 +27,7 @@ external client
 | Proxy service  |
 +--------+-------+
          |
-         | private Modal networking, gRPC
+         | private Modal networking, Monarch actor call
          v
 +---------------------+
 | Controller service  |
@@ -35,11 +37,11 @@ external client
      |                              |
      v                              v
 +----------------------+     +----------------------+
-| Trainer coordinator  |     | Inference service    |
-| Megatron rank 0      |     | SGLang HTTP/gRPC     |
+| Trainer role         |     | Rollout role         |
+| Megatron rank 0      |     | RolloutActor/SGLang  |
 +----------+-----------+     +----------+-----------+
            |                            |
-           | Megatron collectives       |
+           | Megatron collectives       | HTTP /generate, /load_lora
            v                            v
    trainer ranks                 SGLang worker(s)
 
@@ -76,15 +78,18 @@ The missing layer is service orchestration across separate Modal machines.
 
 ## Goals
 
-- Run proxy, controller, trainer, and inference as separately addressable Modal
-  services or clustered functions.
+- Run proxy, controller, trainer, and inference as separately addressable
+  i6pn-enabled Modal functions.
 - Keep user code on the existing `ServiceClient` / `TrainingClient` /
   `SamplingClient` API.
 - Make the controller own run lifecycle, topology, readiness, artifact versions,
   and failure policy.
-- Use gRPC for control-plane RPC between roles.
-- Use Modal private networking for container-to-container traffic.
-- Use Modal clustered GPU functions for multi-node trainer ranks.
+- Use Monarch actor calls for internal control-plane communication between
+  proxy, controller, trainer, rollout, and telemetry roles.
+- Use Modal private networking for container-to-container traffic, with every
+  role pinned to the same exact Modal region.
+- Use Modal clustered GPU functions only when gang scheduling is needed for
+  multi-node trainer ranks.
 - Use Modal Volumes for checkpoints, HF full exports, and LoRA adapters.
 - Keep the local CPU suite independent of Modal, CUDA, Megatron, SGLang, and
   model downloads.
@@ -94,6 +99,8 @@ The missing layer is service orchestration across separate Modal machines.
 
 - Do not replace Megatron/NCCL collectives with Ganker RPC.
 - Do not expose Monarch actor handles to clients.
+- Do not add internal protobuf/gRPC services for controller, trainer, rollout,
+  or telemetry unless Monarch proves insufficient for a specific boundary.
 - Do not require SGLang or Megatron in local unit tests.
 - Do not build a public multi-tenant serving platform in this milestone.
 - Do not solve full autoscaling, scheduling economics, or long-running
@@ -111,10 +118,20 @@ Modal gives us three primitives that matter here:
 - `modal.Dict`, `modal.Queue`, and `modal.Volume` for registry, signaling, and
   shared artifacts.
 
-Modal cluster docs expose `cluster_info.rank`, `cluster_info.container_ips`, and
-`cluster_info.container_ipv4_ips` for clustered containers. Ganker should store
-all usable addresses in the registry rather than hard-coding IPv4 or IPv6 into
-the service contract.
+All controller, proxy, trainer, and inference functions that communicate over
+i6pn must be pinned to the same exact Modal region such as `us-east-1`. Broad
+or meta regions such as `us-east` are not sufficient for this design because
+they may not place containers on the same private-network connectivity plane.
+
+`modal.experimental.clustered(...)` is not required merely to get i6pn. It is a
+gang-scheduling tool for tightly coupled multi-node jobs. Single-node trainer,
+SGLang inference, fake distributed roles, and the controller/proxy split should
+use plain `@app.function(i6pn=True, region="us-east-1")`-style placement.
+
+Each role should resolve and publish its own private IPv6 address through the
+registry. The registry must store all usable addresses and the exact Modal
+region, rather than hard-coding IPv4 or broad-region assumptions into the
+service contract.
 
 ## Target Architecture
 
@@ -131,7 +148,7 @@ client process
 | public Ganker API  |
 +---------+----------+
           |
-          | private role RPC
+          | Monarch actor call, private i6pn
           v
 ============================================================================
                        Modal private service mesh
@@ -149,8 +166,8 @@ client process
        |                                          |
        v                                          v
 +--------------------------+          +---------------------------+
-| TrainerCoordinator       |          | InferenceCoordinator      |
-| rank 0 of trainer group  |          | SGLang frontend/process   |
+| Trainer role             |          | Rollout role              |
+| TrainingActor/rank 0     |          | RolloutActor/SGLang client|
 +-------------+------------+          +-------------+-------------+
               |                                     |
               | torch.distributed / Megatron        | SGLang native API
@@ -176,7 +193,8 @@ Responsibilities:
 - Expose the existing Ganker gRPC API.
 - Authenticate requests and set request IDs.
 - Enforce deadlines and max message sizes.
-- Route every operation to the controller.
+- Route every operation to the controller through a private Monarch actor
+  handle.
 - Optionally keep a short-lived cache of controller address metadata.
 - Never own GPU state.
 - Never own run lifecycle.
@@ -191,49 +209,50 @@ The controller is the control plane.
 Responsibilities:
 
 - Create and own `run_id` lifecycle state.
-- Start or discover trainer and inference roles.
+- Start or discover trainer and rollout/inference roles.
 - Maintain a topology registry for each run.
 - Implement readiness barriers before accepting training or sampling calls.
 - Track current gradient, optimizer, checkpoint, and inference-refresh versions.
-- Coordinate `save_weights -> export -> inference refresh`.
-- Route requests to trainer or inference coordinators.
+- Coordinate `save_weights -> export -> rollout refresh`.
+- Route requests to trainer or rollout actors.
 - Record telemetry or forward events to a telemetry service.
 - Detect stale heartbeats and decide whether a run is failed, restartable, or
   needs manual intervention.
 
 The controller should be the only service allowed to mutate run topology.
 
-### Trainer Coordinator
+### Trainer Role
 
-The trainer coordinator is rank 0 of the training role.
+The trainer role is rank 0 of the training worker group.
 
 Responsibilities:
 
-- Own the public trainer RPC endpoint for the controller.
+- Own the trainer-side Monarch actor endpoint for the controller.
 - Coordinate Megatron run creation across ranks.
-- Translate controller RPCs into collective Megatron operations.
+- Translate controller actor calls into collective Megatron operations.
 - Make `forward_backward`, `optim_step`, and `save_weights` collective.
 - Export SGLang-compatible artifacts when requested.
 - Register rank and readiness metadata with the controller registry.
 
-Ranks other than 0 should not accept controller RPC directly unless needed for
+Ranks other than 0 should not accept controller calls directly unless needed for
 diagnostics. Rank 0 fans out work using Megatron/NCCL/torch.distributed.
 
-### Inference Service
+### Rollout / Inference Service
 
-The inference service owns SGLang lifecycle.
+The rollout/inference service owns rollout orchestration and SGLang lifecycle.
 
 Responsibilities:
 
 - Start SGLang with a base model or HF checkpoint.
-- Expose private `/generate` and adapter-loading endpoints.
+- Expose or discover private SGLang `/generate` and adapter-loading endpoints.
 - Refresh from controller-selected artifact versions.
 - Report loaded artifact version and health.
 - Reject sampling if the required artifact version is not loaded.
 
-The existing `SGLangHTTPRuntime` can be reused here, but in distributed mode it
-should usually attach to an already-running private SGLang endpoint rather than
-launching SGLang inside the same RolloutActor process.
+The existing `SGLangHTTPRuntime` can be reused for single-container smoke tests.
+In distributed mode, `RolloutActor` should usually attach to an already-running
+private SGLang endpoint rather than launching SGLang inside the same actor
+process.
 
 ### Telemetry
 
@@ -245,11 +264,13 @@ Telemetry can start simple:
 
 For this milestone, telemetry should not block trainer or inference progress.
 
-## Control Plane RPCs
+## Monarch Control Plane Calls
 
-Keep the external Ganker API stable, but add internal role APIs.
+Keep the external Ganker API stable. Inside Modal, do not add a parallel
+protobuf surface for controller/trainer/inference. Use Monarch actor endpoints
+and the existing Python dataclass contracts from `ganker.contracts`.
 
-### Proxy -> Controller
+### ProxyActor -> ControllerActor
 
 ```text
 CreateTrainingRun
@@ -264,36 +285,38 @@ ShutdownRun
 GetRunStatus
 ```
 
-The proxy can reuse the current public protobuf messages for most calls. The
-controller should return explicit run status and endpoint state for diagnostics.
+The public gRPC proxy continues converting protobuf messages into Python
+contracts at the edge. After that conversion, the proxy forwards typed Python
+requests to the controller actor.
 
-### Controller -> TrainerCoordinator
+### ControllerActor -> TrainingActor
 
 ```text
-TrainerCreateRun(run_config) -> run_state
-TrainerForwardBackward(run_id, batch) -> loss/metrics/usage
-TrainerOptimStep(run_id, optimizer) -> optimizer_version/usage
-TrainerSaveWeights(run_id, kind, export_format) -> WeightArtifact
-TrainerGetStatus(run_id) -> trainer_status
-TrainerShutdown(run_id)
+create_training_run(CreateTrainingRunRequest) -> CreateTrainingRunResponse
+forward_backward(ForwardBackwardRequest) -> ForwardBackwardResponse
+optim_step(OptimStepRequest) -> OptimStepResponse
+save_weights(SaveWeightsRequest) -> SaveWeightsResponse
+get_status(run_id) -> trainer_status
+shutdown(run_id)
 ```
 
 For real Megatron, every mutating call must become a collective operation across
 all ranks.
 
-### Controller -> Inference
+### ControllerActor -> RolloutActor
 
 ```text
-InferenceLoadBaseModel(model_id)
-InferenceRefreshWeights(run_id, artifact, expected_version)
-InferenceSample(run_id, prompt, sampling_params, artifact_version)
-InferenceGetStatus(run_id)
-InferenceShutdown(run_id)
+load_base_model(model_id)
+refresh_weights(RefreshWeightsRequest) -> RefreshWeightsResponse
+get_status(run_id) -> rollout_status
+shutdown(run_id)
 ```
 
-`InferenceSample` can initially proxy through the controller. Later, the
-controller can issue a short-lived sampling route token so the proxy can call
-the inference service directly for lower latency.
+For sampling, the preferred distributed shape is direct HTTP to SGLang. The
+controller should return or record the selected SGLang HTTP route and artifact
+version so `SamplingClient` can call the endpoint directly. The `RolloutActor`
+still owns refresh/version correctness and can provide a local fake sampling
+path for CPU tests.
 
 ## Registry Contract
 
@@ -362,16 +385,15 @@ Important invariants:
 - `forward_backward` is accepted only when the trainer is ready.
 - `optim_step` is accepted only after gradients are pending.
 - `save_weights` is accepted only from a stable trainer state.
-- `sample` may specify an artifact version.
-- If `sample` has no artifact version, it uses the controller's current loaded
-  inference artifact version.
+- A direct sampling route is returned only after the controller has a ready
+  SGLang endpoint and artifact version.
 - `refresh_weights` does not become visible until SGLang reports the expected
   artifact version loaded.
 
 ## Artifact Flow
 
 ```text
-TrainerCoordinator.save_weights
+TrainingActor.save_weights
         |
         | writes raw checkpoint and export payloads
         v
@@ -382,9 +404,9 @@ Modal Volume
 Controller
         |
         | records checkpoint_version and artifact_format
-        | tells inference to refresh expected version
+        | tells RolloutActor to refresh expected version
         v
-Inference service
+RolloutActor / SGLang service
         |
         | loads HF full checkpoint or LoRA adapter
         v
@@ -409,10 +431,11 @@ to inference until exported.
 ```text
 client
   -> proxy.CreateTrainingRun
-  -> controller.CreateTrainingRun
-  -> controller starts trainer role
-  -> controller starts inference role
-  -> roles register endpoints and heartbeat
+  -> ControllerActor.create_training_run
+  -> controller starts or discovers trainer role
+  -> controller starts or discovers inference role
+  -> roles publish i6pn Monarch/SGLang endpoints and heartbeat
+  -> controller attach_to_workers for Monarch roles
   -> controller reaches READY
   -> proxy returns TrainingRun
 ```
@@ -422,8 +445,8 @@ client
 ```text
 client
   -> proxy.ForwardBackward
-  -> controller.ForwardBackward
-  -> trainer rank0 RPC
+  -> ControllerActor.forward_backward
+  -> TrainingActor.forward_backward on trainer rank0
   -> Megatron collective forward/backward across ranks
   -> trainer returns loss/metrics/usage
   -> controller records state and telemetry
@@ -434,39 +457,46 @@ client
 ```text
 client
   -> proxy.SaveWeights
-  -> controller.SaveWeights
-  -> trainer rank0 collective checkpoint/export
+  -> ControllerActor.save_weights
+  -> TrainingActor.save_weights collective checkpoint/export
   -> Modal Volume artifact
-  -> controller.RefreshWeights
-  -> inference loads artifact
+  -> ControllerActor.refresh_weights
+  -> RolloutActor refreshes the SGLang endpoint
   -> controller marks artifact ready
 ```
 
 ### Sampling
 
-Initial path:
+Distributed path:
 
 ```text
-client
-  -> proxy.Sample
-  -> controller.Sample
-  -> inference.Sample
-  -> SGLang /generate
-  -> controller telemetry
-  -> proxy response
+TrainingClient.save_weights_and_get_sampling_client
+  -> proxy.SaveWeights / RefreshWeights
+  -> ControllerActor records ready SGLang route + artifact version
+  -> returns SamplingClient configured with HTTP URL
+
+SamplingClient.sample_text
+  -> SGLang HTTP /generate
+  -> local client response
 ```
 
-Later low-latency path:
+Local fake/singleton tests can still route sampling through `ProxyActor` and
+`RolloutActor` to avoid requiring SGLang or an HTTP server.
+
+Telemetry for direct HTTP sampling should be reported separately after the
+sampling call or collected from SGLang/server logs. It should not put the
+controller back in the synchronous token path.
+
+### Role Attachment
 
 ```text
-client
-  -> proxy.Sample
-  -> proxy asks controller for route/artifact version
-  -> proxy calls inference.Sample directly
-  -> proxy reports usage to controller
+trainer/rollout Modal function starts with i6pn=True and exact region pin
+Monarch-managed role starts run_worker_loop_forever(address=tcp://[ipv6]:port)
+role publishes endpoint metadata to Modal Dict/Queue
+controller reads endpoint metadata
+controller calls monarch.actor.attach_to_workers(...)
+controller spawns or talks to role actors on the attached mesh
 ```
-
-Start with the initial path because it centralizes correctness.
 
 ## Failure Model
 
@@ -511,19 +541,22 @@ Modes:
 ```text
 fake-distributed
   Starts proxy, controller, fake trainer, fake inference as separate Modal
-  containers with i6pn enabled.
+  containers with i6pn enabled and the same exact region pin.
 
 sglang-distributed
-  Starts proxy, controller, fake trainer, real SGLang inference service.
+  Starts proxy, controller, fake trainer, real SGLang inference service with
+  all private-networked roles in the same exact region.
 
 megatron-sglang-distributed
-  Starts proxy, controller, clustered Megatron trainer, and SGLang inference.
+  Starts proxy, controller, Megatron trainer, and SGLang inference. Use a
+  clustered trainer only when the trainer requires gang-scheduled multi-node
+  placement.
 ```
 
-The first mode should be CPU-only except for any Modal private networking
-requirement. If clustered functions are needed, keep fake-distributed separate
-from the trainer clustered path because Modal clustered functions require GPU
-clusters.
+The first mode should be CPU-only except for the Modal private networking
+requirement. It should prove that plain i6pn-enabled functions in the same
+exact region can publish addresses through the registry and reach one another
+without `modal.experimental.clustered(...)`.
 
 ## Internal Service Startup
 
@@ -532,8 +565,29 @@ starts or references:
 
 - a controller function;
 - a proxy function with a Modal tunnel for external gRPC;
-- a trainer role function;
-- an inference role function.
+- a trainer role function with `i6pn=True` and the deployment region pin;
+- an inference role function with `i6pn=True` and the deployment region pin.
+
+For Monarch-managed trainer workers, roles should follow the
+`attach_to_workers` pattern:
+
+```text
+trainer role starts run_worker_loop_forever(...)
+trainer role publishes tcp://[private-ipv6]:port to the registry
+controller reads the trainer endpoints
+controller calls enable_transport("tcp://[controller-private-ipv6]:controller-port")
+controller calls attach_to_workers(...)
+```
+
+This keeps the controller as the orchestrator without requiring reverse
+Monarch phone-home over a public tunnel.
+
+The controller transport bind is not optional for the Modal distributed path.
+Monarch attach pushes controller config to worker host agents during attach, so
+the controller must advertise an address that workers can reach over i6pn. The
+default hostname-based TCP transport is not sufficient inside Modal because the
+container hostname resolves to local names such as `localhost`/`modal`, not a
+peer-reachable private IPv6 address.
 
 The controller should not depend on local process globals. Every role should be
 able to reconstruct state from:
@@ -545,7 +599,10 @@ able to reconstruct state from:
 ## Security
 
 - External traffic enters only through the proxy.
-- Internal role RPCs should require a run-scoped bearer token or shared secret.
+- Internal Monarch worker listeners must bind only on private i6pn addresses.
+- The first implementation can use Monarch's current `trust_all_connections`
+  mode inside Modal private networking. Before broader deployment, add a real
+  authentication story for worker attachment.
 - Artifact download validates that the requested path is inside the configured
   artifact root.
 - Internal endpoints should bind only to private Modal addresses where possible.
@@ -579,7 +636,7 @@ provide `GetRunStatus` with the current topology and last error.
 
 - Registry key and entry serialization.
 - Run state machine transitions.
-- Controller routing with fake trainer/inference clients.
+- Controller routing with fake trainer/rollout actor handles.
 - Epoch mismatch rejection.
 - Heartbeat timeout detection.
 - Artifact version visibility rules.
@@ -587,24 +644,28 @@ provide `GetRunStatus` with the current topology and last error.
 
 ### Local Integration Tests
 
-Use in-process fake RPC clients or loopback gRPC servers. Do not require Modal.
+Use in-process fake clients, local Monarch process meshes, or loopback gRPC only
+at the external proxy boundary. Do not require Modal.
 
 ```text
-client -> proxy server -> controller -> fake trainer/fake inference
+client -> proxy server -> ProxyActor -> ControllerActor -> fake trainer/fake rollout
 ```
 
 ### Modal Smokes
 
 1. `fake-distributed`
    - Separate Modal containers.
-   - gRPC over private network.
+   - Monarch `attach_to_workers` over i6pn private networking.
+   - Controller calls `enable_transport("tcp://[controller-i6pn]:port")` before
+     any other Monarch API.
    - Fake trainer and fake inference.
    - Proves discovery, heartbeats, routing, and artifact download.
 
 2. `sglang-distributed`
    - Fake trainer emits base-model or fake HF artifact metadata.
    - Real SGLang inference service on GPU.
-   - Controller refreshes inference and samples through proxy.
+   - Controller refreshes inference and returns a direct SGLang HTTP route for
+     sampling.
 
 3. `megatron-sglang-distributed`
    - Megatron Bridge/Core trainer on clustered GPU role.
@@ -614,19 +675,23 @@ client -> proxy server -> controller -> fake trainer/fake inference
 
 ## Implementation Plan
 
-1. Add controller contracts and service interfaces.
+1. Add controller actor contracts using existing Python dataclasses.
 2. Add a `RunRegistry` abstraction with in-memory and Modal Dict backends.
-3. Add controller state machine with fake trainer/inference clients.
-4. Add gRPC services for controller, trainer coordinator, and inference.
-5. Refactor proxy server to route to controller instead of directly owning a
-   local Monarch mesh.
-6. Add fake role servers and local loopback integration tests.
-7. Add `modal_apps/distributed_mesh.py --mode fake-distributed`.
-8. Add SGLang distributed inference role and Modal smoke.
-9. Add trainer coordinator role for single-node Megatron.
-10. Add clustered Megatron trainer role.
-11. Add save/export/refresh orchestration from trainer to SGLang.
-12. Add failure/heartbeat/epoch tests and served/manual tunnel mode.
+3. Add controller state machine with fake trainer/rollout actor handles.
+4. Add Modal role functions that start Monarch worker listeners, publish i6pn
+   endpoints, and stay alive.
+5. Add controller-side explicit i6pn transport binding and
+   `attach_to_workers` orchestration for the published role endpoints.
+6. Refactor proxy server to route to `ControllerActor` instead of directly
+   owning trainer/rollout topology.
+7. Add fake role actors and local Monarch integration tests.
+8. Add `modal_apps/distributed_mesh.py --mode fake-distributed`.
+9. Add SGLang distributed rollout/inference role and Modal smoke.
+10. Add training role for single-node Megatron.
+11. Add clustered Megatron trainer role only when multi-node training needs
+    gang scheduling.
+12. Add save/export/refresh orchestration from trainer to SGLang.
+13. Add failure/heartbeat/epoch tests and served/manual tunnel mode.
 
 ## Acceptance Criteria
 
@@ -634,26 +699,45 @@ client -> proxy server -> controller -> fake trainer/fake inference
 - Proxy and controller can run as separate processes.
 - Controller owns run topology and state transitions.
 - Fake trainer and fake inference can run on separate Modal containers.
+- A Modal smoke proves controller `attach_to_workers` against a private i6pn
+  worker endpoint in the same exact region.
 - SGLang inference can run on a separate Modal GPU container and be reached over
   private networking.
 - The controller can refresh SGLang to a selected artifact version.
-- A Modal smoke proves `client -> proxy -> controller -> inference -> SGLang`.
+- A Modal smoke proves `client -> proxy -> controller -> refresh -> direct
+  SamplingClient HTTP call to SGLang`.
 - A later Modal smoke proves `client -> proxy -> controller -> trainer ->
-  artifact -> inference -> sample`.
+  artifact -> SGLang route -> direct sample`.
 - Local tests remain CPU-only and do not import heavy ML packages by default.
 
-## Open Questions
+## Resolved Decisions
 
-- Should the controller be a long-running Modal function, a Modal class, or a
-  small gRPC server inside a served function?
-- Should sampling initially route through the controller, or should the proxy get
-  an inference route token and call inference directly?
-- How much run state should be recoverable after controller restart in the first
-  implementation?
-- Should the trainer clustered function be launched per run, or should a warm
-  trainer pool accept multiple runs?
-- Should artifact refresh be synchronous from the client perspective, or should
-  it return an operation ID that can be polled?
+- The controller should be a long-lived CPU Modal function with a long input
+  timeout. It owns deployment and discovery of the other roles.
+- Use Modal i6pn private networking plus exact region pinning for private role
+  connectivity. All controller, proxy, trainer, and inference roles that need
+  to communicate over i6pn must use the same exact Modal region, for example
+  `region="us-east-1"`.
+- Do not use a public `modal.forward` tunnel as the Monarch worker rendezvous
+  mechanism. Use the Monarch `attach_to_workers` style: trainer workers listen
+  on private i6pn addresses, publish endpoints to the registry, and the
+  controller attaches to those worker addresses.
+- In Modal, initialize the controller's Monarch context with an explicit i6pn
+  bind address before any other Monarch call; workers must be able to reach the
+  controller's advertised transport during attach/config push.
+- Do not create internal controller/trainer/rollout protobuf services for this
+  milestone. Internal role orchestration should use Monarch actor endpoints and
+  Python contracts; protobuf remains the external client/proxy boundary.
+- `modal.experimental.clustered(...)` is not required for i6pn connectivity.
+  Use it only when the trainer needs gang-scheduled multi-node placement.
+- `SamplingClient` should receive an HTTP URL and call the Modal/SGLang HTTP
+  server directly. This lets sampling use Modal's native HTTP serving and
+  autoscaling path.
+- The first implementation does not need controller recovery. If the controller
+  dies, active runs can be marked interrupted or failed.
+- The trainer role may stay warm and accept multiple runs in serial. It does
+  not need to support multiple concurrent runs.
+- Artifact refresh should return an operation ID that clients can poll.
 
 ## References
 

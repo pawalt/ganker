@@ -83,3 +83,15 @@ def test_sglang_modal_app_compiles():
         ],
         check=True,
     )
+
+
+def test_distributed_mesh_modal_app_compiles():
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            "modal_apps/distributed_mesh.py",
+        ],
+        check=True,
+    )

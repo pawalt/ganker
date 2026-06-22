@@ -34,7 +34,12 @@ from ganker.contracts import (
     WeightArtifact,
 )
 from ganker.config import MegatronBackendConfig, SGLangBackendConfig
-from ganker.orchestration import LocalMonarchMesh, start_local_monarch_mesh
+from ganker.orchestration import (
+    LocalDistributedMonarchMesh,
+    LocalMonarchMesh,
+    start_local_distributed_monarch_mesh,
+    start_local_monarch_mesh,
+)
 from ganker.transport import MonarchProxyTransport, ProxyTransport
 
 
@@ -70,7 +75,7 @@ class ServiceClient:
     """
 
     _transport: ProxyTransport
-    _owned_mesh: LocalMonarchMesh | None = None
+    _owned_mesh: LocalMonarchMesh | LocalDistributedMonarchMesh | None = None
 
     @classmethod
     def local(
@@ -87,6 +92,33 @@ class ServiceClient:
         mesh = start_local_monarch_mesh(
             artifact_root,
             transport=monarch_transport,
+            training_backend=training_backend,
+            inference_backend=inference_backend,
+            training_backend_config=training_backend_config,
+            inference_backend_config=inference_backend_config,
+        )
+        return cls(
+            _transport=MonarchProxyTransport(mesh.proxy, timeout=timeout),
+            _owned_mesh=mesh,
+        )
+
+    @classmethod
+    def local_distributed(
+        cls,
+        artifact_root: Path,
+        *,
+        deployment_id: str = "local",
+        run_id: str = "run-000001",
+        training_backend: str = "fake",
+        inference_backend: str = "fake",
+        training_backend_config: dict | MegatronBackendConfig | None = None,
+        inference_backend_config: dict | SGLangBackendConfig | None = None,
+        timeout: float = 20,
+    ) -> "ServiceClient":
+        mesh = start_local_distributed_monarch_mesh(
+            artifact_root,
+            deployment_id=deployment_id,
+            run_id=run_id,
             training_backend=training_backend,
             inference_backend=inference_backend,
             training_backend_config=training_backend_config,

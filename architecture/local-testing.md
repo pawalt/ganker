@@ -36,6 +36,23 @@ MonarchProxyTransport(mesh.proxy)
 TrainingClient / SamplingClient methods
 ```
 
+`ServiceClient.local_distributed(tmp_path)` exercises the controller path and
+Monarch `attach_to_workers` without Modal:
+
+```text
+local worker subprocess: run_worker_loop_forever("tcp://127.0.0.1:port")
+        |
+        v
+InMemoryRunRegistry records trainer/rollout endpoints
+        |
+        v
+controller process attaches to worker endpoints
+        |
+        +-- TrainingActor on trainer worker
+        +-- RolloutActor on rollout worker
+        +-- TelemetryActor, ControllerActor, ControllerProxyActor locally
+```
+
 ## Unit vs Integration Tests
 
 ```text
@@ -52,6 +69,13 @@ integration test
   real Monarch process mesh
   public ServiceClient
   real actor endpoint calls
+  fake local backends
+  temporary filesystem artifact root
+
+distributed integration test
+  local worker subprocesses
+  Monarch attach_to_workers over 127.0.0.1 TCP
+  public ServiceClient.local_distributed(...)
   fake local backends
   temporary filesystem artifact root
 

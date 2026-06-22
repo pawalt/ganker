@@ -20,6 +20,7 @@ uv run pytest
 
 - Internal orchestration uses PyTorch Monarch actors, not gRPC.
 - External remote clients use gRPC through `ServiceClient.connect_grpc(...)` and `GrpcProxyTransport`; keep Monarch handles private to the server process.
+- Do not add internal controller/trainer/rollout protobuf or gRPC services for distributed Modal orchestration unless explicitly requested. Use Monarch `attach_to_workers` and actor endpoints internally; protobuf belongs at the external proxy boundary.
 - Public callers should use `ServiceClient` / `TrainingClient`; do not expose Monarch `.choose(...).get()` calls in user-facing APIs.
 - New external proxy adapters should implement `ProxyTransport`.
 - Keep request/response contracts as plain Python dataclasses in `ganker.contracts`; convert to protobuf only at the `ganker.rpc` boundary.
@@ -51,6 +52,9 @@ uv run pytest
 - Modal smoke implementation lives in `tests/modal_smoke/` as importable test helpers. `scripts/megatron_bridge_smoke.py` is only a compatibility CLI wrapper, and `modal_apps/megatron_smoke.py` should call the importable helpers directly.
 - SGLang backend tests live in `tests/test_sglang_backend.py`; run them with `uv run pytest tests/test_sglang_backend.py` and do not require SGLang, CUDA, or model downloads.
 - Real SGLang execution smoke tests should run through Modal/GPU infrastructure. Use `source ~/.codex/modal.env` and `modal run modal_apps/sglang_smoke.py --mode client`.
+- Distributed Modal roles that communicate over i6pn must all use `i6pn=True` and the same exact Modal region, such as `region="us-east-1"`. Do not use broad/meta regions such as `us-east` for i6pn-connected controller, proxy, trainer, or inference roles.
+- Distributed Monarch attach across Modal containers needs a reachable controller transport too. Call `enable_transport("tcp://[controller-i6pn]:port")` before any other Monarch API in the controller container, then `attach_to_workers(...)` against worker endpoints like `tcp://[worker-i6pn]:26600`.
+- Distributed Modal smoke tests live in `modal_apps/distributed_mesh.py`. Use `source ~/.codex/modal.env` and `uv run modal run modal_apps/distributed_mesh.py --mode tcp-smoke --port 26620` to verify private i6pn TCP, then `uv run modal run modal_apps/distributed_mesh.py --mode fake-distributed --port 26600 --controller-port 26610` to verify Monarch `attach_to_workers`.
 - Keep tests lightweight enough to run with `uv run pytest` on a CPU-only development machine.
 
 ## gRPC Codegen
