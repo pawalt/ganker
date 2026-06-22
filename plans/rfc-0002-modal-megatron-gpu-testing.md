@@ -123,25 +123,31 @@ The first implementation should prioritize reliability over image build speed.
 
 ## Runtime Strategy
 
-Use a subprocess runtime first.
+Use an in-process runtime first for the single-GPU smoke. RFC 0003 defines the
+runtime lifecycle in detail and makes Megatron-Core's `get_forward_backward_func()`
+the primary implementation primitive for Ganker's `forward_backward(...)` API.
 
 ```text
 MegatronTrainingBackend
   |
   v
-TorchrunMegatronRuntime
+InProcessMegatronRuntime
   |
   v
-python -m torch.distributed.run --nproc_per_node=1 scripts/megatron_bridge_smoke.py
+megatron.core.pipeline_parallel.get_forward_backward_func()
 ```
 
 Rationale:
 
-- Megatron Bridge examples use distributed launchers.
-- Modal's GPU docs recommend subprocess launch patterns for frameworks that manage their own distributed process lifecycle.
-- It avoids mixing Monarch actor lifecycle and Megatron rank lifecycle in one Python process.
+- `get_forward_backward_func()` is low-level enough to match the Tinker-shaped
+  `forward_backward(...)` API.
+- The first smoke should prove the same stateful lifecycle the Ganker API exposes:
+  initialize, forward/backward, optimizer step, checkpoint/export.
+- Keeping the runtime inside `TrainingActor` avoids inventing a worker protocol
+  before the core Megatron adapter is proven.
 
-Later, this can be replaced or supplemented with an in-process runtime if the API proves stable.
+A subprocess or `torchrun` runtime remains a likely fallback for multi-rank,
+multi-GPU, or stronger process-isolation scenarios.
 
 ## Smoke Script
 
@@ -238,15 +244,16 @@ uv run pytest -m megatron_cpu
 ### M3: Standalone Megatron Bridge Smoke
 
 - Add `scripts/megatron_bridge_smoke.py`.
-- Run it inside Modal GPU via subprocess.
+- Run it inside Modal GPU with an in-process Megatron Bridge/Core runtime.
 - Keep it independent of Monarch and Ganker at first.
 - Use a tiny synthetic setup.
 
-### M4: Torchrun Runtime Adapter
+### M4: In-Process Runtime Adapter
 
-- Add `TorchrunMegatronRuntime`.
+- Add `InProcessMegatronRuntime`.
 - Wire it into `MegatronTrainingBackend` behind config.
-- Translate `forward_backward`, `optim_step`, and `save_weights` into subprocess calls or a worker protocol.
+- Translate `forward_backward`, `optim_step`, and `save_weights` into Megatron
+  runtime calls inside the actor process.
 
 ### M5: Ganker End-to-End Modal Smoke
 
@@ -281,13 +288,15 @@ inside Modal.
 - Should `TorchrunMegatronRuntime` be stateless subprocess-per-call, or should it manage a long-lived worker process?
 - How should Modal volumes be used for checkpoint artifacts and cache reuse?
 - What GPU should be the default: A100, L40S, or H100?
+- When should a subprocess or `torchrun` runtime be added for multi-rank tests?
 
 ## Risks
 
 - Megatron Bridge dependencies may require a specific CUDA/PyTorch/Transformer Engine stack.
 - Image build time may dominate iteration.
-- A subprocess-per-call runtime may be too slow for production, even if it is adequate for smoke tests.
-- A long-lived worker protocol adds complexity.
+- In-process Megatron initialization may leave process-global distributed state
+  that is hard to reset between runs.
+- A later long-lived worker protocol may still be needed for multi-rank execution.
 - Modal GPU availability and cold starts can make smoke tests slower than local tests.
 - Tiny synthetic training may not catch multi-GPU or real model conversion failures.
 
@@ -304,4 +313,3 @@ Order:
 5. Then wire the Ganker backend through that runtime.
 
 This keeps Modal, image dependencies, Megatron Bridge, and Ganker actor orchestration from all failing at the same time.
-
