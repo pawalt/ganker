@@ -119,3 +119,27 @@ def test_distributed_sft_job_compiles():
         ],
         check=True,
     )
+
+
+def test_qwen_sft_modal_infra_compiles():
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            "modal_apps/qwen_sft/infra.py",
+        ],
+        check=True,
+    )
+
+
+def test_qwen_sft_modal_example_compiles():
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            "modal_apps/qwen_sft/sft.py",
+        ],
+        check=True,
+    )

@@ -113,7 +113,33 @@ multi-node training; it is not required for i6pn connectivity.
 
 ## Smoke Tests
 
-The Modal implementation is split into:
+The preferred Qwen SFT example is intentionally narrow:
+
+```text
+modal_apps/qwen_sft/infra.py
+  -> one deployable app for Qwen3 0.6B
+  -> Megatron Bridge controller/trainer image
+  -> SGLang rollout image
+  -> shared artifact and HF cache volumes
+  -> i6pn worker rendezvous and Monarch attach
+
+modal_apps/qwen_sft/sft.py
+  -> one Tinker-style SFT example
+  -> ServiceClient / TrainingClient / SamplingClient only
+  -> dataset, tokenizer, train, save, refresh rollout, sample
+```
+
+Deploy and run it:
+
+```bash
+source ~/.codex/modal.env
+GANKER_MODAL_GPU=A100 uv run modal deploy modal_apps/qwen_sft/infra.py
+GANKER_MODAL_GPU=A100 uv run modal run modal_apps/qwen_sft/sft.py \
+  --startup-timeout 900 \
+  --sglang-startup-timeout 900
+```
+
+The generic Modal harness remains available for lower-level smokes:
 
 ```text
 modal_apps/distributed/infra.py

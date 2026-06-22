@@ -98,7 +98,22 @@ modal run modal_apps/sglang_smoke.py --mode client
 That smoke starts SGLang for `Qwen/Qwen3-0.6B`, then samples through
 `ServiceClient.local(..., inference_backend="sglang")`.
 
-Distributed Modal orchestration is split between deployable infra and job code:
+The clean Qwen SFT Modal example is split into one infra file and one training
+file:
+
+```bash
+source ~/.codex/modal.env
+GANKER_MODAL_GPU=A100 uv run modal deploy modal_apps/qwen_sft/infra.py
+GANKER_MODAL_GPU=A100 uv run modal run modal_apps/qwen_sft/sft.py --startup-timeout 900 --sglang-startup-timeout 900
+```
+
+`modal_apps/qwen_sft/infra.py` deploys only the Qwen3 0.6B Megatron Bridge
+trainer plus SGLang rollout shape. `modal_apps/qwen_sft/sft.py` is the
+Tinker-style example: create batches, call `TrainingClient`, save weights,
+refresh rollout, and sample through `SamplingClient`.
+
+The generic distributed Modal harness remains available for lower-level smokes
+and back-compat:
 
 ```bash
 source ~/.codex/modal.env
