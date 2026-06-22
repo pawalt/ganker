@@ -67,10 +67,31 @@ Those tests cover import isolation, backend config mapping, Datum-to-tensor
 conversion when torch is installed, and the mocked Megatron runtime lifecycle.
 They do not run real Megatron forward/backward.
 
-Real Megatron execution should be tested through the future Modal GPU path:
+Real Megatron-Core execution is tested through the Modal GPU smoke path:
 
 ```bash
-GANKER_RUN_MEGATRON_TESTS=1 uv run pytest -m megatron
+source ~/.codex/modal.env
+modal run modal_apps/megatron_smoke.py --mode env
+modal run modal_apps/megatron_smoke.py --mode pytest-cpu
+modal run modal_apps/megatron_smoke.py --mode megatron
 ```
+
+The `env` mode reports CUDA, torch, Megatron-Core, and Megatron Bridge
+availability. The `pytest-cpu` mode runs the repo's CPU suite inside the Modal
+image. The `megatron` mode runs a tiny synthetic GPT training step using
+Megatron-Core's `get_forward_backward_func()`, takes one optimizer step, and
+writes a checkpoint under `/tmp/ganker-megatron-smoke` in the Modal container.
+
+Useful overrides:
+
+```bash
+GANKER_MODAL_GPU=A100 modal run modal_apps/megatron_smoke.py --mode megatron
+GANKER_MODAL_BASE_IMAGE=nvcr.io/nvidia/pytorch:<tag> modal run modal_apps/megatron_smoke.py --mode megatron
+modal run modal_apps/megatron_smoke.py --mode megatron --num-steps 2 --sequence-length 32
+```
+
+The current `--mode ganker` path is a boundary probe: it verifies that the
+public client can reach the Megatron backend, but it will report `wired: false`
+until `InProcessMegatronRuntime` is implemented behind `MegatronTrainingBackend`.
 
 See `architecture/` for the local orchestration diagrams.
