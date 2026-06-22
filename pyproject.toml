@@ -22,3 +22,7 @@ build-backend = "hatchling.build"
 asyncio_mode = "auto"
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    "megatron_cpu: CPU-only Megatron Bridge adapter preflight tests",
+    "megatron: GPU-backed Megatron Bridge functional tests",
+]

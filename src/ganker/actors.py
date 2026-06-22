@@ -7,8 +7,7 @@ from typing import Any
 
 from monarch.actor import Actor, endpoint
 
-from ganker.artifacts import FilesystemArtifactStore
-from ganker.backends.fake import FakeInferenceBackend, FakeTrainingBackend
+from ganker.backends.factory import build_inference_backend, build_training_backend
 from ganker.components import RolloutComponent, TelemetryComponent, TelemetryLedger, TrainingComponent
 from ganker.contracts import (
     CreateTrainingRunRequest,
@@ -35,9 +34,18 @@ from ganker.contracts import (
 class TrainingActor(Actor):
     """Owns singleton training state and delegates execution to a backend."""
 
-    def __init__(self, artifact_root: str):
-        store = FilesystemArtifactStore(Path(artifact_root))
-        self._component = TrainingComponent(FakeTrainingBackend(store))
+    def __init__(
+        self,
+        artifact_root: str,
+        backend_kind: str = "fake",
+        backend_config: dict[str, Any] | None = None,
+    ):
+        backend = build_training_backend(
+            backend_kind,
+            Path(artifact_root),
+            config=backend_config,
+        )
+        self._component = TrainingComponent(backend)
 
     @endpoint
     def create_training_run(self, request: CreateTrainingRunRequest) -> CreateTrainingRunResponse:
@@ -59,9 +67,18 @@ class TrainingActor(Actor):
 class RolloutActor(Actor):
     """Owns rollout state and delegates sample calls to an inference backend."""
 
-    def __init__(self, artifact_root: str):
-        store = FilesystemArtifactStore(Path(artifact_root))
-        self._component = RolloutComponent(FakeInferenceBackend(store))
+    def __init__(
+        self,
+        artifact_root: str,
+        backend_kind: str = "fake",
+        backend_config: dict[str, Any] | None = None,
+    ):
+        backend = build_inference_backend(
+            backend_kind,
+            Path(artifact_root),
+            config=backend_config,
+        )
+        self._component = RolloutComponent(backend)
 
     @endpoint
     def refresh_weights(self, request: RefreshWeightsRequest) -> RefreshWeightsResponse:

@@ -54,4 +54,23 @@ actor handles directly.
 uv run pytest
 ```
 
+The default suite stays CPU-only and does not require Megatron Bridge, `sglang`,
+CUDA, model weights, or checkpoints.
+
+Megatron adapter preflight tests run locally without a GPU:
+
+```bash
+uv run pytest -m megatron_cpu
+```
+
+Those tests cover import isolation, backend config mapping, Datum-to-tensor
+conversion when torch is installed, and mocked Megatron backend lifecycle. They
+do not run real Megatron forward/backward.
+
+Real Megatron execution should be tested through the future Modal GPU path:
+
+```bash
+GANKER_RUN_MEGATRON_TESTS=1 uv run pytest -m megatron
+```
+
 See `architecture/` for the local orchestration diagrams.

@@ -30,6 +30,7 @@ from ganker.contracts import (
     TuningMode,
     WeightArtifact,
 )
+from ganker.config import MegatronBackendConfig
 from ganker.orchestration import LocalMonarchMesh, start_local_monarch_mesh
 from ganker.transport import MonarchProxyTransport, ProxyTransport
 
@@ -72,11 +73,19 @@ class ServiceClient:
         artifact_root: Path,
         *,
         monarch_transport: str = "tcp",
+        training_backend: str = "fake",
+        inference_backend: str = "fake",
+        training_backend_config: dict | MegatronBackendConfig | None = None,
+        inference_backend_config: dict | None = None,
         timeout: float = 20,
     ) -> "ServiceClient":
         mesh = start_local_monarch_mesh(
             artifact_root,
             transport=monarch_transport,
+            training_backend=training_backend,
+            inference_backend=inference_backend,
+            training_backend_config=training_backend_config,
+            inference_backend_config=inference_backend_config,
         )
         return cls(
             _transport=MonarchProxyTransport(mesh.proxy, timeout=timeout),

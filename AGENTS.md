@@ -38,4 +38,6 @@ uv run pytest
 - Unit test pure components and fake backends directly.
 - Integration test orchestration through real Monarch actor endpoints.
 - Local integration tests should use fake backends and temporary filesystem artifact roots.
+- CPU Megatron preflight tests should use `pytest -m megatron_cpu`; they may skip optional torch/Megatron Bridge checks when those packages are absent.
+- Real Megatron execution tests should use the `megatron` marker and run through Modal/GPU infrastructure, not the default local suite.
 - Keep tests lightweight enough to run with `uv run pytest` on a CPU-only development machine.
