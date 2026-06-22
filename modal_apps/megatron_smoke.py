@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import subprocess
+import sys
 from typing import Any
 
 import modal
@@ -70,35 +70,26 @@ core_image = _common_image()
 app = modal.App("ganker-megatron-smoke")
 
 
-def _run_remote_script(args: list[str]) -> dict[str, Any]:
-    command = [
-        "python",
-        str(REMOTE_ROOT / "scripts" / "megatron_bridge_smoke.py"),
-        *args,
-    ]
-    completed = subprocess.run(
-        command,
-        cwd=str(REMOTE_ROOT),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0:
-        return {
-            "ok": False,
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-            "command": command,
-        }
+def _add_remote_import_paths() -> None:
+    for path in (REMOTE_ROOT / "tests", REMOTE_ROOT / "src", REMOTE_ROOT):
+        path_text = str(path)
+        if path_text not in sys.path:
+            sys.path.insert(0, path_text)
+
+
+def _run_remote_smoke(args: list[str]) -> dict[str, Any]:
+    _add_remote_import_paths()
     import json
 
-    return json.loads(completed.stdout)
+    from modal_smoke.common import result_to_json
+    from modal_smoke.cli import run_from_argv
+
+    return json.loads(result_to_json(run_from_argv(args)))
 
 
 @app.function(gpu=GPU, image=core_image, timeout=60 * 60)
 def run_core_remote(mode: str, script_args: list[str]) -> dict[str, Any]:
-    return _run_remote_script(["--mode", mode, *script_args])
+    return _run_remote_smoke(["--mode", mode, *script_args])
 
 
 @app.local_entrypoint()

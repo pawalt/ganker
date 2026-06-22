@@ -43,4 +43,5 @@ uv run pytest
 - Local integration tests should use fake backends and temporary filesystem artifact roots.
 - CPU Megatron preflight tests should use `pytest -m megatron_cpu`; they may skip optional torch/Megatron Bridge checks when those packages are absent.
 - Real Megatron execution smoke tests should run through Modal/GPU infrastructure, not the default local suite. Use `source ~/.codex/modal.env` and `modal run modal_apps/megatron_smoke.py --mode megatron`.
+- Modal smoke implementation lives in `tests/modal_smoke/` as importable test helpers. `scripts/megatron_bridge_smoke.py` is only a compatibility CLI wrapper, and `modal_apps/megatron_smoke.py` should call the importable helpers directly.
 - Keep tests lightweight enough to run with `uv run pytest` on a CPU-only development machine.

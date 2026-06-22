@@ -84,6 +84,8 @@ Megatron-Core's `get_forward_backward_func()`, takes one optimizer step, and
 writes a checkpoint under `/tmp/ganker-megatron-smoke` in the Modal container.
 The `ganker` mode runs the same kind of tiny Megatron-Core training step
 through the public `ServiceClient -> ProxyActor -> TrainingActor` path.
+The underlying smoke modes live in `tests/modal_smoke/` so they can be imported
+and unit-tested locally while still executing inside Modal.
 
 Useful overrides:
 
