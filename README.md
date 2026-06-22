@@ -93,5 +93,7 @@ modal run modal_apps/megatron_smoke.py --mode megatron --num-steps 2 --sequence-
 The current `--mode ganker` path is a boundary probe: it verifies that the
 public client can reach the Megatron backend, but it will report `wired: false`
 until `InProcessMegatronRuntime` is implemented behind `MegatronTrainingBackend`.
+The Modal app intentionally does not install Megatron Bridge yet; the direct
+real-training smoke uses Megatron-Core only.
 
 See `architecture/` for the local orchestration diagrams.

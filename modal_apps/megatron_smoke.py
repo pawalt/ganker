@@ -31,7 +31,7 @@ def _base_image():
     return modal.Image.debian_slim(python_version=PYTHON_VERSION)
 
 
-def _common_image(*, include_bridge: bool = False):
+def _common_image():
     packages = [
         "torch<3",
         "megatron-core",
@@ -39,13 +39,17 @@ def _common_image(*, include_bridge: bool = False):
         "pytest>=8.0",
         "pytest-asyncio>=0.23",
     ]
-    if include_bridge:
-        packages.append("megatron-bridge")
 
     return (
         _base_image()
         .apt_install("git", "curl")
         .uv_pip_install(*packages)
+        .env(
+            {
+                "PYTHONPATH": str(REMOTE_ROOT / "src"),
+                "GANKER_ARTIFACT_ROOT": "/tmp/ganker-artifacts",
+            }
+        )
         .add_local_dir(
             PROJECT_ROOT,
             remote_path=str(REMOTE_ROOT),
@@ -59,17 +63,10 @@ def _common_image(*, include_bridge: bool = False):
                 ".local_artifacts",
             ],
         )
-        .env(
-            {
-                "PYTHONPATH": str(REMOTE_ROOT / "src"),
-                "GANKER_ARTIFACT_ROOT": "/tmp/ganker-artifacts",
-            }
-        )
     )
 
 
-core_image = _common_image(include_bridge=False)
-bridge_image = _common_image(include_bridge=True)
+core_image = _common_image()
 app = modal.App("ganker-megatron-smoke")
 
 
@@ -104,11 +101,6 @@ def run_core_remote(mode: str, script_args: list[str]) -> dict[str, Any]:
     return _run_remote_script(["--mode", mode, *script_args])
 
 
-@app.function(gpu=GPU, image=bridge_image, timeout=60 * 60)
-def run_bridge_remote(mode: str, script_args: list[str]) -> dict[str, Any]:
-    return _run_remote_script(["--mode", mode, *script_args])
-
-
 @app.local_entrypoint()
 def main(
     mode: str = "env",
@@ -140,9 +132,7 @@ def main(
     if allow_cpu:
         script_args.append("--allow-cpu")
 
-    if mode == "ganker":
-        result = run_bridge_remote.remote(mode, script_args)
-    elif mode in {"env", "pytest-cpu", "megatron"}:
+    if mode in {"env", "pytest-cpu", "megatron", "ganker"}:
         result = run_core_remote.remote(mode, script_args)
     else:
         raise ValueError(f"unknown mode: {mode}")

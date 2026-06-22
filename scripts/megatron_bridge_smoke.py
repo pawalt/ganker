@@ -332,7 +332,6 @@ def run_megatron_core_smoke(args: argparse.Namespace) -> dict[str, Any]:
 def run_ganker_boundary_probe(args: argparse.Namespace) -> dict[str, Any]:
     from ganker import ServiceClient
     from ganker.contracts import Datum, ModelInput, TensorData
-    from ganker.errors import BackendUnavailableError, InvalidRequestError
 
     datum = Datum(
         model_input=ModelInput.from_ints([1, 2, 3, 4]),
@@ -342,8 +341,10 @@ def run_ganker_boundary_probe(args: argparse.Namespace) -> dict[str, Any]:
         },
     )
 
+    client = None
+    close_error = None
     try:
-        with ServiceClient.local(
+        client = ServiceClient.local(
             Path(args.artifact_root),
             training_backend="megatron",
             training_backend_config={
@@ -354,20 +355,32 @@ def run_ganker_boundary_probe(args: argparse.Namespace) -> dict[str, Any]:
                 "load_weights": False,
             },
             timeout=60,
-        ) as client:
-            training = client.create_lora_training_client(
-                base_model=args.base_model,
-                rank=args.lora_rank,
-            )
-            training.forward_backward(datum, loss_fn="cross_entropy")
-    except (BackendUnavailableError, InvalidRequestError, RuntimeError) as exc:
+        )
+        training = client.create_lora_training_client(
+            base_model=args.base_model,
+            rank=args.lora_rank,
+        )
+        training.forward_backward(datum, loss_fn="cross_entropy")
+    except Exception as exc:
+        if client is not None:
+            try:
+                client.close()
+            except Exception as shutdown_exc:
+                close_error = str(shutdown_exc)
         return {
             "ok": True,
             "mode": "ganker",
             "wired": False,
             "reason": str(exc),
+            "close_error": close_error,
             "note": "The direct Megatron-Core smoke is implemented; the Ganker Megatron runtime is still a stub.",
         }
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     return {
         "ok": True,
