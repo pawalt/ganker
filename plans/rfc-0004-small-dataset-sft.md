@@ -402,9 +402,9 @@ Initial M1 files:
 
 ```text
 examples/tiny_sft.jsonl
-src/ganker/sft/__init__.py
-src/ganker/sft/data.py
-src/ganker/sft/loop.py
+examples/sft/__init__.py
+examples/sft/data.py
+examples/sft/loop.py
 tests/test_sft_data.py
 tests/test_sft_loop.py
 modal_apps/sft.py
@@ -412,11 +412,12 @@ modal_apps/sft.py
 
 Rationale:
 
-- Dataset and SFT loop code are reusable product-facing helpers, so they can live under `src/ganker/sft`.
+- Dataset and SFT loop code are example workflow helpers, so they should stay out of the core `ganker` package for now.
 - Modal-only execution glue should stay in `modal_apps/`.
 - Modal smoke test internals should stay in `tests/modal_smoke/`.
 
-If the helpers feel too experimental during M1, start them under `examples/sft/` and promote to `src/ganker/sft` once the API stabilizes.
+If the helpers become part of the supported public API later, promote them from
+`examples/sft/` into `src/ganker/sft`.
 
 ## API Surface
 
@@ -433,7 +434,7 @@ training.save_weights()
 Add optional convenience APIs only after the helper stabilizes:
 
 ```python
-from ganker.sft import load_jsonl_sft_dataset, run_sft
+from examples.sft import load_jsonl_sft_batches, run_sft
 ```
 
 Do not add a new actor endpoint like `run_sft` yet. The actor API should continue to expose low-level Tinker-shaped training primitives.
@@ -466,13 +467,23 @@ Do not add a new actor endpoint like `run_sft` yet. The actor API should continu
 ## Open Questions
 
 - Should M1 use a deterministic toy tokenizer, a real HF tokenizer, or both?
+Answer: use a deterministic toy tokenizer for M1.
+
 - Which small public HF model should be the first Bridge SFT target?
+Answer: use Qwen3 0.6B for the first Bridge-backed target.
+
 - Should full fine-tuning be the first meaningful M2 path, with LoRA added later?
+Answer: use full fine-tuning first; add LoRA later.
+
 - Should `run_sft` live under `src/ganker/sft` immediately or start in `examples/sft`?
+Answer: keep it in `examples/sft` to avoid polluting the core package with domain-specific workflow code.
+
 - What artifact format should be considered the first rollout-compatible target: HF full checkpoint, LoRA adapter, or Megatron checkpoint?
+Answer: target an HF full checkpoint first.
+
 - How much of dataset packing should be implemented before real pretrained-model SFT?
+Answer: skip packing for now; make a small fixed-length dataset work first.
 
 ## Recommendation
 
 Implement M1 first with the current tiny Megatron-Core runtime and a toy JSONL dataset. Keep the SFT loop outside the actors and drive the existing public training API. Once the data path, loss masks, loop, Modal execution, and artifacts are stable, move to M2 and make Megatron Bridge load a real small pretrained model.
-

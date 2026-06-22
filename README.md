@@ -99,4 +99,17 @@ The Modal app intentionally does not install Megatron Bridge yet; the direct
 real-training smoke uses Megatron-Core only. Megatron Bridge is still needed
 later for Hugging Face conversion, production model providers, and export.
 
+Toy SFT over the public Ganker API runs through a dedicated Modal app:
+
+```bash
+source ~/.codex/modal.env
+modal run modal_apps/sft.py --mode env
+modal run modal_apps/sft.py --mode toy-sft
+```
+
+The first SFT path lives under `examples/sft/`, uses a deterministic toy
+tokenizer, converts `examples/tiny_sft.jsonl` into `Datum` batches, and drives
+`ServiceClient -> TrainingClient` with full fine-tuning semantics against the
+tiny Megatron-Core runtime.
+
 See `architecture/` for the local orchestration diagrams.
