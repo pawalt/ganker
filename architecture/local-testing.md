@@ -1,6 +1,6 @@
 # Local Testing Orchestration
 
-Local tests do not start ports or gRPC servers. They start a Monarch process mesh and spawn actors into that mesh. User-facing tests call `ServiceClient`, not Monarch actor handles.
+Most local tests do not start ports or gRPC servers. They start a Monarch process mesh and spawn actors into that mesh. The remote-boundary integration tests additionally bind a loopback gRPC server on `127.0.0.1:0` and still use fake backends only. User-facing tests call `ServiceClient`, not Monarch actor handles.
 
 ## Harness
 
@@ -53,6 +53,13 @@ integration test
   real actor endpoint calls
   fake local backends
   temporary filesystem artifact root
+
+grpc integration test
+  real Monarch process mesh
+  local ProxyGrpcServer on 127.0.0.1:0
+  ServiceClient.connect_grpc(...)
+  fake local backends
+  artifact download over gRPC
 ```
 
 This keeps component behavior easy to test without Monarch while still verifying the actual actor orchestration path.

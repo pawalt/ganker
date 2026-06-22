@@ -13,7 +13,8 @@ client / training loop
   | ProxyTransport |
   +----------------+
         |
-        | Monarch actor endpoint calls
+        | local: Monarch actor endpoint calls
+        | remote: gRPC calls into ProxyGrpcServer
         v
   +-------------+
   | ProxyActor  |
@@ -67,14 +68,18 @@ SamplingClient.sample(...)
 ProxyTransport
 ```
 
-For local development, `MonarchProxyTransport` wraps a `ProxyActor` handle. A
-future HTTP or gRPC transport can implement the same `ProxyTransport` protocol.
+For local development, `MonarchProxyTransport` wraps a `ProxyActor` handle. For
+remote clients, `GrpcProxyTransport` calls `ProxyGrpcServer`, which owns the
+local Monarch mesh privately and delegates to the same `ProxyActor`.
 
-## Why Monarch Instead Of gRPC Internally
+## Why Monarch Internally And gRPC Externally
 
 Monarch gives this prototype the orchestration primitive we need for the internal mesh: actor processes, endpoint calls, futures, and later multi-process or multi-host placement. That replaces gRPC for trainer/proxy/rollout/telemetry communication inside the system.
 
-An external gRPC or HTTP adapter can still be added later if non-Python clients need a stable wire API. That adapter should implement `ProxyTransport` or call `ProxyActor`; it should not replace the internal Monarch actor graph.
+gRPC is the external process boundary. `ServiceClient.connect_grpc(...)` keeps
+remote callers off Monarch while giving the project explicit protobuf
+contracts, generated stubs, deadlines, metadata, and status codes. The gRPC
+server is an adapter; it should not replace the internal Monarch actor graph.
 
 ## Singleton Flow
 
@@ -113,6 +118,9 @@ client -> ProxyTransport -> ProxyActor -> RolloutActor -> FakeInferenceBackend
                          |
                          v
                   ProxyActor -> TelemetryActor
+
+download_artifact_file
+client -> ProxyTransport -> local file read or ProxyGrpcServer -> FilesystemArtifactStore
 ```
 
 ## Production Shape

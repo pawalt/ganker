@@ -17,6 +17,11 @@ class ArtifactKind(IntEnum):
     DELTA = 2
 
 
+class ArtifactFileKind(IntEnum):
+    MANIFEST = 1
+    PAYLOAD = 2
+
+
 @dataclass(frozen=True)
 class RequestContext:
     request_id: str = ""
@@ -147,6 +152,22 @@ class WeightArtifact:
     kind: ArtifactKind
     manifest_path: str
     payload_path: str
+
+
+@dataclass(frozen=True)
+class DownloadArtifactFileRequest:
+    context: RequestContext
+    artifact: WeightArtifact
+    file_kind: ArtifactFileKind
+
+
+@dataclass(frozen=True)
+class DownloadArtifactFileResponse:
+    request_id: str
+    artifact: WeightArtifact
+    file_kind: ArtifactFileKind
+    path: str
+    contents: bytes
 
 
 @dataclass(frozen=True)

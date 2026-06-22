@@ -7,12 +7,14 @@ from typing import Protocol
 
 from ganker.contracts import (
     AdamParams,
+    ArtifactKind,
     Datum,
     ForwardBackwardOutput,
     ModelInput,
     SampledSequence,
     SamplingParams,
     TrainingRun,
+    TuningMode,
     Usage,
     WeightArtifact,
 )
@@ -49,7 +51,7 @@ class TrainingBackend(Protocol):
         self,
         *,
         base_model: str,
-        tuning_mode: int,
+        tuning_mode: TuningMode,
         lora_rank: int,
     ) -> TrainingRun:
         ...
@@ -72,7 +74,7 @@ class TrainingBackend(Protocol):
     ) -> OptimStepResult:
         ...
 
-    def save_weights(self, *, run_id: str, kind: int) -> WeightArtifact:
+    def save_weights(self, *, run_id: str, kind: ArtifactKind) -> WeightArtifact:
         ...
 
 

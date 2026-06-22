@@ -8,9 +8,12 @@ from typing import Literal, Sequence
 
 from ganker.contracts import (
     AdamParams,
+    ArtifactFileKind,
     ArtifactKind,
     CreateTrainingRunRequest,
     Datum,
+    DownloadArtifactFileRequest,
+    DownloadArtifactFileResponse,
     ForwardBackwardRequest,
     ForwardBackwardResponse,
     GetTelemetrySummaryRequest,
@@ -92,7 +95,28 @@ class ServiceClient:
             _owned_mesh=mesh,
         )
 
+    @classmethod
+    def connect_grpc(
+        cls,
+        target: str,
+        *,
+        timeout: float = 20,
+        bearer_token: str | None = None,
+    ) -> "ServiceClient":
+        from ganker.rpc.client import GrpcProxyTransport
+
+        return cls(
+            _transport=GrpcProxyTransport.connect(
+                target,
+                timeout=timeout,
+                bearer_token=bearer_token,
+            )
+        )
+
     def close(self) -> None:
+        transport_close = getattr(self._transport, "close", None)
+        if transport_close is not None:
+            transport_close()
         if self._owned_mesh is not None:
             self._owned_mesh.stop()
             self._owned_mesh = None
@@ -169,6 +193,26 @@ class ServiceClient:
             GetTelemetrySummaryRequest(
                 context=RequestContext(request_id),
                 run_id=run_id,
+            )
+        )
+
+    def download_artifact_file(
+        self,
+        artifact: WeightArtifact,
+        *,
+        file_kind: ArtifactFileKind | Literal["manifest", "payload"] = ArtifactFileKind.PAYLOAD,
+        request_id: str = "",
+    ) -> DownloadArtifactFileResponse:
+        if isinstance(file_kind, str):
+            file_kind = {
+                "manifest": ArtifactFileKind.MANIFEST,
+                "payload": ArtifactFileKind.PAYLOAD,
+            }[file_kind]
+        return self._transport.download_artifact_file(
+            DownloadArtifactFileRequest(
+                context=RequestContext(request_id),
+                artifact=artifact,
+                file_kind=file_kind,
             )
         )
 

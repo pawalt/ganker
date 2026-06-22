@@ -1,0 +1,226 @@
+syntax = "proto3";
+
+package ganker.v1;
+
+service GankerProxy {
+  rpc CreateTrainingRun(CreateTrainingRunRequest) returns (CreateTrainingRunResponse);
+  rpc ForwardBackward(ForwardBackwardRequest) returns (ForwardBackwardResponse);
+  rpc OptimStep(OptimStepRequest) returns (OptimStepResponse);
+  rpc SaveWeights(SaveWeightsRequest) returns (SaveWeightsResponse);
+  rpc RefreshWeights(RefreshWeightsRequest) returns (RefreshWeightsResponse);
+  rpc Sample(SampleRequest) returns (SampleResponse);
+  rpc GetTelemetrySummary(GetTelemetrySummaryRequest) returns (GetTelemetrySummaryResponse);
+  rpc DownloadArtifactFile(DownloadArtifactFileRequest) returns (DownloadArtifactFileResponse);
+}
+
+enum TuningMode {
+  TUNING_MODE_UNSPECIFIED = 0;
+  TUNING_MODE_LORA = 1;
+  TUNING_MODE_FULL = 2;
+}
+
+enum ArtifactKind {
+  ARTIFACT_KIND_UNSPECIFIED = 0;
+  ARTIFACT_KIND_FULL = 1;
+  ARTIFACT_KIND_DELTA = 2;
+}
+
+enum ArtifactFileKind {
+  ARTIFACT_FILE_KIND_UNSPECIFIED = 0;
+  ARTIFACT_FILE_KIND_MANIFEST = 1;
+  ARTIFACT_FILE_KIND_PAYLOAD = 2;
+}
+
+message RequestContext {
+  string request_id = 1;
+}
+
+message ModelInput {
+  repeated int64 token_ids = 1;
+}
+
+message TensorData {
+  repeated double values = 1;
+}
+
+message Datum {
+  ModelInput model_input = 1;
+  map<string, TensorData> loss_fn_inputs = 2;
+}
+
+message SamplingParams {
+  int64 max_tokens = 1;
+  double temperature = 2;
+  repeated string stop = 3;
+}
+
+message SampledSequence {
+  repeated int64 tokens = 1;
+  repeated double logprobs = 2;
+  string stop_reason = 3;
+}
+
+message ForwardBackwardOutput {
+  double loss = 1;
+  map<string, double> metrics = 2;
+  repeated LossFnOutput loss_fn_outputs = 3;
+}
+
+message LossFnOutput {
+  map<string, TensorData> values = 1;
+}
+
+message AdamParams {
+  double learning_rate = 1;
+  double beta1 = 2;
+  double beta2 = 3;
+  double eps = 4;
+  double weight_decay = 5;
+}
+
+message Usage {
+  int64 input_tokens = 1;
+  int64 output_tokens = 2;
+  int64 training_steps = 3;
+  int64 samples = 4;
+}
+
+message UsageEvent {
+  string request_id = 1;
+  string run_id = 2;
+  string event_source = 3;
+  Usage usage = 4;
+}
+
+message UsageBySource {
+  string event_source = 1;
+  Usage usage = 2;
+  int64 event_count = 3;
+}
+
+message TelemetrySummary {
+  string run_id = 1;
+  Usage total = 2;
+  int64 event_count = 3;
+  repeated UsageBySource by_source = 4;
+}
+
+message WeightArtifact {
+  string run_id = 1;
+  int64 checkpoint_version = 2;
+  ArtifactKind kind = 3;
+  string manifest_path = 4;
+  string payload_path = 5;
+}
+
+message TrainingRun {
+  string run_id = 1;
+  string base_model = 2;
+  TuningMode tuning_mode = 3;
+  int64 lora_rank = 4;
+  int64 checkpoint_version = 5;
+}
+
+message CreateTrainingRunRequest {
+  RequestContext context = 1;
+  string base_model = 2;
+  TuningMode tuning_mode = 3;
+  int64 lora_rank = 4;
+}
+
+message CreateTrainingRunResponse {
+  string request_id = 1;
+  TrainingRun run = 2;
+}
+
+message ForwardBackwardRequest {
+  RequestContext context = 1;
+  string run_id = 2;
+  repeated Datum data = 3;
+  string loss_fn = 4;
+  map<string, double> loss_fn_config = 5;
+}
+
+message ForwardBackwardResponse {
+  string request_id = 1;
+  string run_id = 2;
+  ForwardBackwardOutput output = 3;
+  int64 gradient_version = 4;
+  Usage usage = 5;
+}
+
+message OptimStepRequest {
+  RequestContext context = 1;
+  string run_id = 2;
+  AdamParams optimizer = 3;
+}
+
+message OptimStepResponse {
+  string request_id = 1;
+  string run_id = 2;
+  int64 optimizer_step = 3;
+  int64 checkpoint_version = 4;
+  Usage usage = 5;
+}
+
+message SaveWeightsRequest {
+  RequestContext context = 1;
+  string run_id = 2;
+  ArtifactKind kind = 3;
+}
+
+message SaveWeightsResponse {
+  string request_id = 1;
+  WeightArtifact artifact = 2;
+}
+
+message RefreshWeightsRequest {
+  RequestContext context = 1;
+  string run_id = 2;
+  optional WeightArtifact artifact = 3;
+}
+
+message RefreshWeightsResponse {
+  string request_id = 1;
+  WeightArtifact artifact = 2;
+}
+
+message SampleRequest {
+  RequestContext context = 1;
+  string run_id = 2;
+  ModelInput prompt = 3;
+  SamplingParams sampling_params = 4;
+  int64 num_samples = 5;
+}
+
+message SampleResponse {
+  string request_id = 1;
+  string run_id = 2;
+  repeated SampledSequence sequences = 3;
+  WeightArtifact artifact = 4;
+  Usage usage = 5;
+}
+
+message GetTelemetrySummaryRequest {
+  RequestContext context = 1;
+  string run_id = 2;
+}
+
+message GetTelemetrySummaryResponse {
+  string request_id = 1;
+  TelemetrySummary summary = 2;
+}
+
+message DownloadArtifactFileRequest {
+  RequestContext context = 1;
+  WeightArtifact artifact = 2;
+  ArtifactFileKind file_kind = 3;
+}
+
+message DownloadArtifactFileResponse {
+  string request_id = 1;
+  WeightArtifact artifact = 2;
+  ArtifactFileKind file_kind = 3;
+  string path = 4;
+  bytes contents = 5;
+}

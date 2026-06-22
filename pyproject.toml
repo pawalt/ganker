@@ -5,11 +5,14 @@ description = "Local singleton Tinker-style Monarch prototype."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "grpcio>=1.81.1",
+    "protobuf>=6.33.6",
     "torchmonarch>=0.5.0",
 ]
 
 [dependency-groups]
 dev = [
+    "grpcio-tools>=1.81.1",
     "modal>=1.5.0",
     "pyright>=1.1.410",
     "pytest>=8.0",

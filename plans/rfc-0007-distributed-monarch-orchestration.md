@@ -144,8 +144,8 @@ The internal Monarch mesh can still be created with `this_host().spawn_procs(nam
 Add protobuf definitions under:
 
 ```text
-proto/ganker/v1/proxy.proto
-src/ganker/rpc/generated/
+proto/ganker/rpc/v1/proxy.proto
+src/ganker/rpc/v1/
 ```
 
 The service should mirror the existing `ProxyTransport` methods:
@@ -163,6 +163,7 @@ service GankerProxy {
   rpc RefreshWeights(RefreshWeightsRequest) returns (RefreshWeightsResponse);
   rpc Sample(SampleRequest) returns (SampleResponse);
   rpc GetTelemetrySummary(GetTelemetrySummaryRequest) returns (GetTelemetrySummaryResponse);
+  rpc DownloadArtifactFile(DownloadArtifactFileRequest) returns (DownloadArtifactFileResponse);
 }
 ```
 
@@ -272,6 +273,9 @@ Server responsibilities:
 
 The first implementation should use synchronous `grpc.server(...)` because the public `ProxyTransport` API is synchronous today. We can switch the server internals to `grpc.aio` later if concurrent streaming or async cancellation becomes important.
 
+The initial implementation should not enable gRPC reflection. Local and Modal
+smokes can debug through tests and structured return payloads.
+
 ## Error Semantics
 
 Map known exceptions to stable gRPC status codes:
@@ -315,7 +319,8 @@ Initial modes:
 3. `--mode serve`
    - Starts the gRPC server and reports host/port metadata.
    - Keeps the Modal worker alive for manual remote testing.
-   - This mode can assume the caller has a way to reach the Modal worker over TCP, such as a Modal-supported tunnel, private network, or in-cluster client.
+   - Uses a Modal tunnel around the gRPC port for manual testing.
+   - Keeps this as a singleton function/container, not an autoscaled web endpoint.
 
 The first two modes are enough to prove the Ganker gRPC boundary. They do not require Modal multinode clustering.
 
@@ -343,7 +348,7 @@ uv run python -m grpc_tools.protoc \
   -I proto \
   --python_out=src \
   --grpc_python_out=src \
-  proto/ganker/v1/proxy.proto
+  proto/ganker/rpc/v1/proxy.proto
 ```
 
 ## Local Testing
@@ -379,7 +384,9 @@ For any served/manual mode that should outlive one function invocation, mount a 
 /mnt/ganker-artifacts
 ```
 
-The gRPC transport does not change artifact semantics. `save_weights` still returns a `WeightArtifact` containing manifest and payload paths meaningful to the server environment. A later RFC should define downloadable artifacts for clients outside the Modal filesystem.
+The gRPC transport does not change artifact semantics. `save_weights` still returns a `WeightArtifact` containing manifest and payload paths meaningful to the server environment.
+
+Remote clients cannot rely on those paths being locally readable, so this milestone includes a unary `DownloadArtifactFile` RPC. The server reads either the manifest or payload path from the artifact metadata, validates that it lives under the configured artifact root, and returns bytes to the client.
 
 ## Security
 
@@ -424,8 +431,8 @@ The coordinator must make `create_training_run`, `forward_backward`, `optim_step
 
 ## Implementation Plan
 
-1. Add `proto/ganker/v1/proxy.proto`.
-2. Add generated protobuf/gRPC Python modules under `src/ganker/rpc/generated/`.
+1. Add `proto/ganker/rpc/v1/proxy.proto`.
+2. Add generated protobuf/gRPC Python modules under `src/ganker/rpc/v1/`.
 3. Add `ganker.rpc.conversion` for dataclass/protobuf mapping.
 4. Add `GrpcProxyTransport`.
 5. Add `ProxyGrpcServer` that wraps a private local Monarch mesh.
@@ -434,7 +441,8 @@ The coordinator must make `create_training_run`, `forward_backward`, `optim_step
 8. Add `modal_apps/remote_mesh.py --mode grpc-smoke-fake`.
 9. Add `modal_apps/remote_mesh.py --mode grpc-smoke-qwen-lora`.
 10. Add optional bearer-token metadata support.
-11. Add served/manual mode once the smoke path is stable.
+11. Add artifact download through gRPC.
+12. Add served/manual mode through a Modal tunnel once the smoke path is stable.
 
 ## Acceptance Criteria
 
@@ -446,10 +454,11 @@ The coordinator must make `create_training_run`, `forward_backward`, `optim_step
 - Modal Qwen LoRA gRPC smoke passes and exports `hf-lora-adapter`.
 - No user-facing API exposes Monarch actor handles.
 - No gRPC payload uses pickle.
+- Artifact manifest/payload bytes can be downloaded through gRPC.
 
-## Open Questions
+## Decisions From Open Questions
 
-- Should the first implementation expose gRPC reflection for easier `grpcurl` debugging?
-- Should served Modal mode use raw gRPC reachability, a Modal tunnel, or a thin Modal web endpoint that forwards to the same gRPC server?
-- Should artifacts be downloadable through a gRPC endpoint, or should artifact download wait for an object-store-backed artifact layer?
-- Do we need streaming RPCs soon, or are unary request/response calls enough for the current training API?
+- Do not expose gRPC reflection in the first implementation.
+- Use a Modal tunnel for served/manual testing so the deployment remains singleton-shaped.
+- Artifacts should be downloadable through gRPC in this milestone.
+- Unary request/response RPCs are enough for the current training API; do not add streaming yet.

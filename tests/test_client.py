@@ -5,6 +5,8 @@ from ganker.contracts import (
     CreateTrainingRunRequest,
     CreateTrainingRunResponse,
     Datum,
+    DownloadArtifactFileRequest,
+    DownloadArtifactFileResponse,
     ForwardBackwardOutput,
     ForwardBackwardRequest,
     ForwardBackwardResponse,
@@ -107,6 +109,19 @@ class FakeProxyTransport:
         return GetTelemetrySummaryResponse(
             request_id=request.context.request_id,
             summary=TelemetrySummary(run_id=request.run_id),
+        )
+
+    def download_artifact_file(
+        self,
+        request: DownloadArtifactFileRequest,
+    ) -> DownloadArtifactFileResponse:
+        self.requests.append(request)
+        return DownloadArtifactFileResponse(
+            request_id=request.context.request_id,
+            artifact=request.artifact,
+            file_kind=request.file_kind,
+            path=request.artifact.payload_path,
+            contents=b"payload",
         )
 
 

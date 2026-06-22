@@ -19,9 +19,10 @@ uv run pytest
 ## Architecture Direction
 
 - Internal orchestration uses PyTorch Monarch actors, not gRPC.
+- External remote clients use gRPC through `ServiceClient.connect_grpc(...)` and `GrpcProxyTransport`; keep Monarch handles private to the server process.
 - Public callers should use `ServiceClient` / `TrainingClient`; do not expose Monarch `.choose(...).get()` calls in user-facing APIs.
 - New external proxy adapters should implement `ProxyTransport`.
-- Keep request/response contracts as plain Python dataclasses in `ganker.contracts` unless there is a concrete need for an external wire format.
+- Keep request/response contracts as plain Python dataclasses in `ganker.contracts`; convert to protobuf only at the `ganker.rpc` boundary.
 - Emulate Tinker's outer API shape where practical (`Datum`, `ModelInput`, `TensorData`, `TrainingClient`, `SamplingClient`), but keep local payload implementations lightweight unless a real integration requires the full SDK type system.
 - The local singleton mesh is spawned through `ganker.orchestration.start_local_monarch_mesh`.
 - Use `TelemetryActor` for usage/events/tracking. Do not call this component `BillingActor`; pricing and billing policy are out of scope for this layer.
@@ -40,8 +41,19 @@ uv run pytest
 
 - Unit test pure components and fake backends directly.
 - Integration test orchestration through real Monarch actor endpoints.
-- Local integration tests should use fake backends and temporary filesystem artifact roots.
+- Local integration tests should use fake backends and temporary filesystem artifact roots. gRPC integration tests may bind `127.0.0.1:0`, but must not require Modal, CUDA, Megatron, SGLang, or model downloads.
 - CPU Megatron preflight tests should use `pytest -m megatron_cpu`; they may skip optional torch/Megatron Bridge checks when those packages are absent.
 - Real Megatron execution smoke tests should run through Modal/GPU infrastructure, not the default local suite. Use `source ~/.codex/modal.env` and `modal run modal_apps/megatron_smoke.py --mode megatron`.
+- Remote mesh smoke tests live in `modal_apps/remote_mesh.py`. Use `modal run modal_apps/remote_mesh.py --mode grpc-smoke-fake` for fake backends, `--mode grpc-smoke-qwen-lora` for Bridge/GPU, and `--mode serve` for a singleton gRPC server behind a Modal tunnel.
 - Modal smoke implementation lives in `tests/modal_smoke/` as importable test helpers. `scripts/megatron_bridge_smoke.py` is only a compatibility CLI wrapper, and `modal_apps/megatron_smoke.py` should call the importable helpers directly.
 - Keep tests lightweight enough to run with `uv run pytest` on a CPU-only development machine.
+
+## gRPC Codegen
+
+- Source protobufs live under `proto/ganker/rpc/v1`.
+- Generated Python modules live under `src/ganker/rpc/v1` and are checked in.
+- Regenerate with:
+
+```bash
+uv run python -m grpc_tools.protoc -I proto --python_out=src --grpc_python_out=src proto/ganker/rpc/v1/proxy.proto
+```
