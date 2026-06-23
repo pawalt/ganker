@@ -220,19 +220,27 @@ def job_config(
     }
 
 
-def _validate_cluster_config(config: dict[str, Any]) -> DistributedTrainingConfig:
+def _validate_cluster_config(
+    config: dict[str, Any],
+    *,
+    actual_cluster_size: int | None = None,
+) -> DistributedTrainingConfig:
     distributed = training_config_from_mapping(config)
-    if distributed.n_nodes != CLUSTER_SIZE:
+    expected_cluster_size = actual_cluster_size if actual_cluster_size is not None else CLUSTER_SIZE
+    if distributed.n_nodes != expected_cluster_size:
         raise ValueError(
             "config n_nodes must match GANKER_QWEN_SFT_MULTINODE_NODES because Modal "
-            f"cluster size is fixed at import time: config={distributed.n_nodes} env={CLUSTER_SIZE}"
+            "cluster size is fixed at import time: "
+            f"config={distributed.n_nodes} actual={expected_cluster_size}"
         )
     if distributed.gpus_per_node != GPUS_PER_NODE:
         raise ValueError(
             "config gpus_per_node must match the Modal GPU request: "
             f"config={distributed.gpus_per_node} gpu={GPU!r} parsed={GPUS_PER_NODE}"
         )
-    if config["mode"] in {"qwen-lora-sft", "hf-ddp-baseline"}:
+    if config["mode"] == "qwen-lora-sft":
+        distributed.require_supported_model_parallel()
+    elif config["mode"] == "hf-ddp-baseline":
         distributed.require_dp_only()
     return distributed
 
@@ -280,10 +288,10 @@ def _namespace_from_config(config: dict[str, Any], *, result_path: str) -> Names
 def run_clustered_trainer(config: dict[str, Any]) -> dict[str, Any]:
     add_remote_import_paths()
     artifact_volume.reload()
-    distributed = _validate_cluster_config(config)
     cluster_info = modal.experimental.get_cluster_info()
-    result_path = _result_path(config)
     container_ips = [str(value) for value in cluster_info.container_ips]
+    distributed = _validate_cluster_config(config, actual_cluster_size=len(container_ips))
+    result_path = _result_path(config)
     launch = TorchrunLaunchConfig(
         nnodes=distributed.n_nodes,
         nproc_per_node=distributed.gpus_per_node,
@@ -325,7 +333,7 @@ def run_clustered_trainer(config: dict[str, Any]) -> dict[str, Any]:
     payload = read_json(result_path)
     payload["modal_cluster"] = {
         "cluster_id": cluster_info.cluster_id,
-        "cluster_size": CLUSTER_SIZE,
+        "cluster_size": len(container_ips),
         "cluster_rank": int(cluster_info.rank),
         "gpu": GPU,
         "region": REGION,

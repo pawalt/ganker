@@ -17,6 +17,46 @@ T = TypeVar("T")
 
 
 @dataclass(frozen=True)
+class MegatronRankInfo:
+    """Rank metadata needed by torchrun entrypoints.
+
+    This module stays import-isolated from Megatron. Real Megatron jobs should
+    prefer `parallel_state` after model-parallel initialization; the pure helper
+    below exists for validation, local tests, and fallback metadata.
+    """
+
+    global_rank: int
+    world_size: int
+    data_parallel_rank: int
+    data_parallel_size: int
+    tensor_model_parallel_rank: int
+    tensor_model_parallel_size: int
+    pipeline_model_parallel_rank: int
+    pipeline_model_parallel_size: int
+
+    @property
+    def is_artifact_writer(self) -> bool:
+        return (
+            self.data_parallel_rank == 0
+            and self.tensor_model_parallel_rank == 0
+            and self.pipeline_model_parallel_rank == 0
+        )
+
+    def as_dict(self) -> dict[str, int | bool]:
+        return {
+            "global_rank": self.global_rank,
+            "world_size": self.world_size,
+            "data_parallel_rank": self.data_parallel_rank,
+            "data_parallel_size": self.data_parallel_size,
+            "tensor_model_parallel_rank": self.tensor_model_parallel_rank,
+            "tensor_model_parallel_size": self.tensor_model_parallel_size,
+            "pipeline_model_parallel_rank": self.pipeline_model_parallel_rank,
+            "pipeline_model_parallel_size": self.pipeline_model_parallel_size,
+            "is_artifact_writer": self.is_artifact_writer,
+        }
+
+
+@dataclass(frozen=True)
 class DistributedTrainingConfig:
     n_nodes: int
     gpus_per_node: int
@@ -77,6 +117,15 @@ class DistributedTrainingConfig:
             raise ValueError("the first multinode SFT implementation supports DP-only: tp=1, pp=1")
         if self.grad_accum_steps != 1:
             raise ValueError("the first multinode SFT implementation requires grad_accum_steps=1")
+
+    def require_supported_model_parallel(self, *, allow_pipeline_parallel: bool = False) -> None:
+        """Validate the supported model-parallel shape for the current SFT path."""
+
+        if self.pipeline_model_parallel_size != 1 and not allow_pipeline_parallel:
+            raise ValueError(
+                "pipeline_model_parallel_size > 1 is not supported by the current "
+                "Qwen SFT entrypoint; TP-only model parallelism is supported first"
+            )
 
     def as_dict(self) -> dict[str, int]:
         payload = asdict(self)
@@ -224,6 +273,51 @@ def select_data_parallel_item(
         raise ValueError("data_parallel_rank must be in [0, data_parallel_size)")
     index = (step * data_parallel_size + data_parallel_rank) % len(items)
     return items[index]
+
+
+def select_data_parallel_items(
+    items: Sequence[T],
+    *,
+    step: int,
+    data_parallel_rank: int,
+    data_parallel_size: int,
+    grad_accum_steps: int,
+) -> list[T]:
+    """Select all local microbatches for one logical optimizer step."""
+
+    if grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be positive")
+    return [
+        select_data_parallel_item(
+            items,
+            step=step * grad_accum_steps + microstep,
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_size=data_parallel_size,
+        )
+        for microstep in range(grad_accum_steps)
+    ]
+
+
+def rank_info_from_global_rank(
+    config: DistributedTrainingConfig,
+    *,
+    global_rank: int,
+) -> MegatronRankInfo:
+    """Return deterministic rank info for contiguous TP/PP replica groups."""
+
+    if global_rank < 0 or global_rank >= config.world_size:
+        raise ValueError("global_rank must be in [0, world_size)")
+    model_parallel_rank = global_rank % config.model_parallel_size
+    return MegatronRankInfo(
+        global_rank=global_rank,
+        world_size=config.world_size,
+        data_parallel_rank=global_rank // config.model_parallel_size,
+        data_parallel_size=config.data_parallel_size,
+        tensor_model_parallel_rank=model_parallel_rank % config.tensor_model_parallel_size,
+        tensor_model_parallel_size=config.tensor_model_parallel_size,
+        pipeline_model_parallel_rank=model_parallel_rank // config.tensor_model_parallel_size,
+        pipeline_model_parallel_size=config.pipeline_model_parallel_size,
+    )
 
 
 def rank_result_path(result_path: str | Path, rank: int) -> Path:

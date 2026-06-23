@@ -11,6 +11,7 @@ from ganker.backends.megatron import (
     MegatronRunHandle,
     MegatronTrainingBackend,
     _save_bridge_lora_adapter,
+    _split_tensor_batch,
     _write_safetensors_state_dict,
     datums_to_tensor_batch,
 )
@@ -162,6 +163,33 @@ def test_datums_to_tensor_batch_uses_cpu_tensors_when_torch_is_available():
     assert batch.input_ids.tolist() == [[1, 2, 3], [4, 5, 6]]
     assert batch.target_tokens.tolist() == [[2, 3, 0], [5, 6, 0]]
     assert batch.weights.tolist() == [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]
+
+
+def test_split_tensor_batch_builds_configured_microbatches():
+    pytest.importorskip("torch")
+    batch = datums_to_tensor_batch(
+        [_datum([1, 2, 3]), _datum([4, 5, 6]), _datum([7, 8, 9]), _datum([10, 11, 12])],
+        loss_fn="cross_entropy",
+        device="cpu",
+    )
+
+    microbatches = _split_tensor_batch(batch, micro_batch_size=2)
+
+    assert len(microbatches) == 2
+    assert microbatches[0].input_ids.tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert microbatches[1].target_tokens.tolist() == [[8, 9, 0], [11, 12, 0]]
+
+
+def test_split_tensor_batch_rejects_partial_microbatch():
+    pytest.importorskip("torch")
+    batch = datums_to_tensor_batch(
+        [_datum([1, 2, 3]), _datum([4, 5, 6]), _datum([7, 8, 9])],
+        loss_fn="cross_entropy",
+        device="cpu",
+    )
+
+    with pytest.raises(InvalidRequestError, match="divisible"):
+        _split_tensor_batch(batch, micro_batch_size=2)
 
 
 def test_safetensors_writer_clones_tied_tensors(tmp_path: Path):

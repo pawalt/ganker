@@ -205,6 +205,18 @@ def test_qwen_sft_multinode_hf_comparison_compiles():
     )
 
 
+def test_qwen_model_parallel_sft_example_compiles():
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            "modal_apps/qwen_model_parallel_sft/sft.py",
+        ],
+        check=True,
+    )
+
+
 def test_starcoder_ganker_modal_files_compile():
     for path in [
         "modal_apps/starcoder_ganker/common.py",

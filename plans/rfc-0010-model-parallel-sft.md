@@ -1,6 +1,6 @@
 # RFC 0010: Model-Parallel SFT for Larger Models
 
-Status: Draft
+Status: TP milestone implemented; PP milestone draft
 
 ## Summary
 
@@ -8,6 +8,12 @@ Extend the Modal Megatron Bridge SFT path from data-parallel-only training to
 model-parallel training. The first target is tensor parallelism (`TP > 1`,
 `PP = 1`), followed by pipeline parallelism (`PP > 1`) once the data iterator,
 microbatching, and loss handling are Megatron-native enough.
+
+Implementation note: the TP-only milestone has landed for the Qwen LoRA SFT
+Modal path. The validated smoke is one Modal clustered node with `H100:8`,
+`TP=2`, `PP=1`, `DP=4`, one Qwen3 0.6B LoRA optimizer step, and HF/PEFT adapter
+export. PP remains explicitly unsupported until Ganker has a pipeline-aware
+forward step.
 
 The goal is to make larger models fit by sharding one logical model across
 multiple GPUs. Data parallelism can increase throughput, but it cannot make a
@@ -527,16 +533,99 @@ Regression tests:
 1. Does Bridge's LoRA HF adapter export require every TP/PP rank to call
    `save_hf_adapter`, or can only writer ranks call it safely?
 
+answer: im not sure. you'll have to look at source code for something like slime.
+
+Resolution: source-read required before implementation. Slime's Bridge HF save
+path calls `bridge.save_hf_pretrained(...)` from the distributed training
+processes and then runs a distributed barrier. That suggests Ganker should not
+assume global rank 0 alone can export Bridge artifacts under TP/PP. The safe
+first implementation is: all Megatron ranks call the Bridge export path, only
+the chosen reporting rank publishes artifact metadata, and a barrier completes
+before rollout reload.
+
 2. Does Bridge expose a provider-native forward step for causal LM training that
    already handles PP cleanly, or should Ganker maintain the forward step?
 
+answer: not sure. ganker may have to maintain this. again, check slime.
+
+Resolution: Ganker should maintain the forward step. Slime keeps its own
+Megatron `forward_step`, builds packed microbatches, calls the model with
+Megatron-compatible kwargs, and passes the returned loss closure into
+`get_forward_backward_func()`. Bridge handles model/checkpoint conversion, but
+the training framework still owns the data iterator and loss closure.
+
 3. How should optimizer state be saved for future resume support under TP/PP?
+
+answer: can rank 0 just save optim state? again, look at slime.
+
+Resolution: no. Rank 0 alone is not the correct optimizer-state plan for TP/PP.
+Use Megatron distributed checkpointing for resumable training checkpoints so all
+ranks participate and optimizer/model shards are saved consistently. Rank 0 can
+write small metadata files, but not the complete optimizer state.
 
 4. What is the first larger target model after Qwen3 0.6B? The answer should be
    chosen based on Modal GPU availability and expected memory footprint.
 
+answer: some qwen around 7b or 30b should do the trick.
+
+Resolution: use Qwen around 7B as the first larger-model target, then Qwen
+around 30B after TP and PP smokes are reliable. The 7B target should prove TP
+without making Modal iteration cost excessive. The 30B target is the first
+stronger proof that the path can train models that really require sharding.
+
 5. Should the public API expose an explicit gradient-accumulation concept, or is
    it enough to keep accumulation fully inside backend/job config?
+
+answer: public api should not expose grad acc. we can do that transparently right if 
+the batch gets too big?
+
+Resolution: keep gradient accumulation out of the public API. It can be chosen
+by backend/job config and, later, by automatic packing based on available local
+microbatches. The public `forward_backward(data=[...])` call must still receive
+enough examples for the logical optimizer step; the backend can split that
+logical step into Megatron microbatches internally.
+
+## Source Read Notes: Slime
+
+Slime is useful prior art because it connects Megatron training, SGLang rollout,
+parallelism settings, distributed checkpointing, and HF export in one codebase.
+The relevant patterns for this RFC are:
+
+- Slime trains through Megatron's `get_forward_backward_func()` and owns the
+  `forward_step` closure. The closure fetches one microbatch, prepares packed
+  sequence parameters, calls the model, and returns a loss closure.
+- Slime batches by Megatron data-parallel rank, not global rank. Its actor data
+  preprocessing uses `mpu.get_data_parallel_rank(...)` and
+  `mpu.get_data_parallel_world_size(...)`.
+- Slime's training loop already treats `num_microbatches` as a per-step value
+  passed into Megatron's schedule. That matches this RFC's preferred
+  accumulation model: one logical training step, many Megatron microbatches.
+- Slime logs and reports metrics only from stable source ranks such as
+  data-parallel rank 0, tensor-parallel rank 0, and the final pipeline stage.
+  Ganker should use the same shape for loss/metadata reporting.
+- Slime's normal checkpoint save path calls Megatron `save_checkpoint(...)`.
+  That is the right model for TP/PP optimizer state because all ranks
+  participate in distributed checkpointing.
+- Slime's Bridge HF export calls `bridge.save_hf_pretrained(...)` in the
+  distributed context and then barriers. Ganker should treat Bridge export as
+  collective until proven otherwise.
+- Slime's raw HF export path uses writer ranks plus a global-rank-zero
+  finalizer. That is useful as a future fallback, but not the first Bridge path.
+- Slime documentation recommends `torch_dist` checkpoints because they support
+  automatic parallel sharding and can be shared across different training
+  parallelism settings. Ganker should prefer `torch_dist` for TP/PP resume
+  support.
+
+Useful references:
+
+- Slime Megatron model loop:
+  <https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/model.py>
+- Slime HF checkpoint saver:
+  <https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/hf_checkpoint_saver.py>
+- Slime Megatron actor:
+  <https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/actor.py>
+- Slime checkpoint docs:
+  <https://github.com/THUDM/slime/blob/main/docs/en/get_started/usage.md>
 
 ## Acceptance Criteria
 

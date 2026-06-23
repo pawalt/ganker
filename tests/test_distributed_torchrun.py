@@ -4,12 +4,15 @@ import pytest
 
 from ganker.distributed.torchrun import (
     DistributedTrainingConfig,
+    MegatronRankInfo,
     TorchrunLaunchConfig,
     entrypoint_args_from_mapping,
     parse_gpu_count,
+    rank_info_from_global_rank,
     rank_result_path,
     read_json,
     select_data_parallel_item,
+    select_data_parallel_items,
     training_config_from_mapping,
     write_json,
 )
@@ -41,7 +44,7 @@ def test_distributed_training_config_rejects_invalid_global_batch():
         )
 
 
-def test_distributed_training_config_first_milestone_is_dp_only():
+def test_distributed_training_config_keeps_legacy_dp_only_guard():
     config = DistributedTrainingConfig(
         n_nodes=2,
         gpus_per_node=8,
@@ -53,6 +56,38 @@ def test_distributed_training_config_first_milestone_is_dp_only():
 
     with pytest.raises(ValueError, match="DP-only"):
         config.require_dp_only()
+
+
+def test_distributed_training_config_supports_tp_only_and_grad_accum():
+    config = DistributedTrainingConfig(
+        n_nodes=2,
+        gpus_per_node=8,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        micro_batch_size=1,
+        global_batch_size=16,
+    )
+
+    config.require_supported_model_parallel()
+
+    assert config.world_size == 16
+    assert config.model_parallel_size == 2
+    assert config.data_parallel_size == 8
+    assert config.grad_accum_steps == 2
+
+
+def test_distributed_training_config_rejects_pp_until_forward_step_exists():
+    config = DistributedTrainingConfig(
+        n_nodes=1,
+        gpus_per_node=8,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        micro_batch_size=1,
+        global_batch_size=4,
+    )
+
+    with pytest.raises(ValueError, match="pipeline_model_parallel_size"):
+        config.require_supported_model_parallel()
 
 
 def test_torchrun_launch_args_match_modal_cluster_shape():
@@ -120,6 +155,48 @@ def test_select_data_parallel_item_round_robins_by_step_and_rank():
     assert select_data_parallel_item(items, step=0, data_parallel_rank=1, data_parallel_size=2) == "b"
     assert select_data_parallel_item(items, step=1, data_parallel_rank=0, data_parallel_size=2) == "c"
     assert select_data_parallel_item(items, step=2, data_parallel_rank=1, data_parallel_size=2) == "b"
+
+
+def test_select_data_parallel_items_returns_one_logical_step_microbatches():
+    items = ["a", "b", "c", "d", "e", "f", "g", "h"]
+
+    assert select_data_parallel_items(
+        items,
+        step=0,
+        data_parallel_rank=0,
+        data_parallel_size=2,
+        grad_accum_steps=2,
+    ) == ["a", "c"]
+    assert select_data_parallel_items(
+        items,
+        step=1,
+        data_parallel_rank=1,
+        data_parallel_size=2,
+        grad_accum_steps=2,
+    ) == ["f", "h"]
+
+
+def test_rank_info_from_global_rank_groups_contiguous_model_replicas():
+    config = DistributedTrainingConfig(
+        n_nodes=1,
+        gpus_per_node=8,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        micro_batch_size=1,
+        global_batch_size=4,
+    )
+
+    rank0 = rank_info_from_global_rank(config, global_rank=0)
+    rank1 = rank_info_from_global_rank(config, global_rank=1)
+    rank2 = rank_info_from_global_rank(config, global_rank=2)
+
+    assert isinstance(rank0, MegatronRankInfo)
+    assert rank0.data_parallel_rank == rank1.data_parallel_rank == 0
+    assert rank0.tensor_model_parallel_rank == 0
+    assert rank1.tensor_model_parallel_rank == 1
+    assert rank2.data_parallel_rank == 1
+    assert rank0.is_artifact_writer is True
+    assert rank1.is_artifact_writer is False
 
 
 def test_json_helpers_round_trip_rank_result(tmp_path: Path):

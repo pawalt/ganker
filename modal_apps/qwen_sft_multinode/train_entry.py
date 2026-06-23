@@ -16,7 +16,9 @@ from ganker.config import MegatronBackendConfig
 from ganker.contracts import AdamParams, ArtifactKind, TuningMode
 from ganker.distributed.torchrun import (
     DistributedTrainingConfig,
-    select_data_parallel_item,
+    MegatronRankInfo,
+    rank_info_from_global_rank,
+    select_data_parallel_items,
     write_json,
 )
 
@@ -114,16 +116,17 @@ def run_nccl_smoke(args: argparse.Namespace) -> None:
 
 def run_qwen_lora_sft(args: argparse.Namespace) -> None:
     distributed = _distributed_config(args)
-    distributed.require_dp_only()
+    distributed.require_supported_model_parallel()
     dist = importlib.import_module("torch.distributed")
     rank = _rank()
-    world_size = _world_size()
+    shared_artifact_root = Path(args.artifact_root)
     artifact_root = (
-        Path(args.artifact_root)
+        shared_artifact_root
         if rank == 0
         else Path("/tmp/ganker-rank-artifacts") / f"rank-{rank:05d}"
     )
     os.environ["GANKER_ARTIFACT_ROOT"] = str(artifact_root)
+    os.environ["GANKER_MEGATRON_CHECKPOINT_ROOT"] = str(shared_artifact_root)
 
     config = MegatronBackendConfig(
         runtime_kind="bridge",
@@ -146,6 +149,7 @@ def run_qwen_lora_sft(args: argparse.Namespace) -> None:
         tuning_mode=TuningMode.LORA,
         lora_rank=int(args.lora_rank),
     )
+    rank_info = _megatron_rank_info(distributed)
 
     tokenizer, batches = _load_batches(args)
     _ = tokenizer
@@ -154,12 +158,14 @@ def run_qwen_lora_sft(args: argparse.Namespace) -> None:
     optimizer_step = 0
     checkpoint_version = 0
     for step in range(int(args.max_steps)):
-        batch = select_data_parallel_item(
+        local_microbatches = select_data_parallel_items(
             batches,
             step=step,
-            data_parallel_rank=rank,
-            data_parallel_size=world_size,
+            data_parallel_rank=rank_info.data_parallel_rank,
+            data_parallel_size=rank_info.data_parallel_size,
+            grad_accum_steps=distributed.grad_accum_steps,
         )
+        batch = [datum for microbatch in local_microbatches for datum in microbatch]
         fb = backend.forward_backward(
             run_id=run.run_id,
             data=batch,
@@ -221,6 +227,7 @@ def run_qwen_lora_sft(args: argparse.Namespace) -> None:
                 "manifest_path": saved.manifest_path if saved is not None else "",
                 "artifact": artifact_payload,
                 "distributed": distributed.as_dict(),
+                "rank": rank_info.as_dict(),
             },
         )
 
@@ -421,6 +428,25 @@ def _distributed_config(args: argparse.Namespace) -> DistributedTrainingConfig:
         pipeline_model_parallel_size=int(args.pipeline_model_parallel_size),
         micro_batch_size=int(args.micro_batch_size),
         global_batch_size=int(args.global_batch_size),
+    )
+
+
+def _megatron_rank_info(distributed: DistributedTrainingConfig) -> MegatronRankInfo:
+    try:
+        parallel_state = importlib.import_module("megatron.core.parallel_state")
+    except ImportError:
+        return rank_info_from_global_rank(distributed, global_rank=_rank())
+    if not parallel_state.model_parallel_is_initialized():
+        return rank_info_from_global_rank(distributed, global_rank=_rank())
+    return MegatronRankInfo(
+        global_rank=_rank(),
+        world_size=_world_size(),
+        data_parallel_rank=int(parallel_state.get_data_parallel_rank()),
+        data_parallel_size=int(parallel_state.get_data_parallel_world_size()),
+        tensor_model_parallel_rank=int(parallel_state.get_tensor_model_parallel_rank()),
+        tensor_model_parallel_size=distributed.tensor_model_parallel_size,
+        pipeline_model_parallel_rank=int(parallel_state.get_pipeline_model_parallel_rank()),
+        pipeline_model_parallel_size=distributed.pipeline_model_parallel_size,
     )
 
 

@@ -236,7 +236,12 @@ class InstalledMegatronBridgeRuntime:
             model=model,
             optimizer=optimizer,
             forward_backward_schedule=get_forward_backward_func(),
-            config={"device": device, "runtime": "megatron-bridge"},
+            config={
+                "device": device,
+                "global_batch_size": config.global_batch_size,
+                "micro_batch_size": config.micro_batch_size,
+                "runtime": "megatron-bridge",
+            },
             base_model=base_model,
             tuning_mode=tuning_mode,
             lora_rank=lora_rank,
@@ -258,13 +263,14 @@ class InstalledMegatronBridgeRuntime:
             raise BackendUnavailableError("Megatron Bridge runtime handle is not initialized")
 
         sequence_length = int(batch.input_ids.shape[1])
-        micro_batch_size = int(batch.input_ids.shape[0])
+        micro_batch_size = int(handle.config.get("micro_batch_size", batch.input_ids.shape[0]))
+        microbatches = _split_tensor_batch(batch, micro_batch_size=micro_batch_size)
         handle.optimizer.zero_grad(set_to_none=True)
         losses_reduced = handle.forward_backward_schedule(
             forward_step_func=_core_forward_step_func,
-            data_iterator=iter([_core_runtime_batch(batch)]),
+            data_iterator=iter([_core_runtime_batch(microbatch) for microbatch in microbatches]),
             model=handle.model,
-            num_microbatches=1,
+            num_microbatches=len(microbatches),
             seq_length=sequence_length,
             micro_batch_size=micro_batch_size,
             decoder_seq_length=sequence_length,
@@ -298,6 +304,12 @@ class InstalledMegatronBridgeRuntime:
         if handle.bridge is None or handle.model is None:
             raise BackendUnavailableError("Megatron Bridge model is not initialized")
         checkpoint_dir = Path(os.getenv("GANKER_ARTIFACT_ROOT", "/tmp/ganker-artifacts"))
+        checkpoint_dir = Path(
+            os.getenv(
+                "GANKER_MEGATRON_CHECKPOINT_ROOT",
+                str(checkpoint_dir),
+            )
+        )
         artifact_subdir = "hf-lora" if handle.tuning_mode is TuningMode.LORA else "hf-full"
         checkpoint_dir = checkpoint_dir / artifact_subdir / run_id / f"checkpoint-{checkpoint_version:06d}"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -372,7 +384,12 @@ class InProcessMegatronCoreRuntime:
             model=model,
             optimizer=optimizer,
             forward_backward_schedule=get_forward_backward_func(),
-            config={"device": device},
+            config={
+                "device": device,
+                "global_batch_size": config.global_batch_size,
+                "micro_batch_size": config.micro_batch_size,
+                "runtime": "megatron-core",
+            },
         )
 
     def forward_backward(
@@ -390,13 +407,14 @@ class InProcessMegatronCoreRuntime:
             raise BackendUnavailableError("Megatron-Core runtime handle is not initialized")
 
         sequence_length = int(batch.input_ids.shape[1])
-        micro_batch_size = int(batch.input_ids.shape[0])
+        micro_batch_size = int(handle.config.get("micro_batch_size", batch.input_ids.shape[0]))
+        microbatches = _split_tensor_batch(batch, micro_batch_size=micro_batch_size)
         handle.optimizer.zero_grad(set_to_none=True)
         losses_reduced = handle.forward_backward_schedule(
             forward_step_func=_core_forward_step_func,
-            data_iterator=iter([_core_runtime_batch(batch)]),
+            data_iterator=iter([_core_runtime_batch(microbatch) for microbatch in microbatches]),
             model=handle.model,
-            num_microbatches=1,
+            num_microbatches=len(microbatches),
             seq_length=sequence_length,
             micro_batch_size=micro_batch_size,
             decoder_seq_length=sequence_length,
@@ -829,6 +847,32 @@ def _core_runtime_batch(batch: MegatronTensorBatch) -> dict[str, Any]:
     }
 
 
+def _split_tensor_batch(batch: MegatronTensorBatch, *, micro_batch_size: int) -> list[MegatronTensorBatch]:
+    if micro_batch_size <= 0:
+        raise InvalidRequestError("micro_batch_size must be positive")
+    total_batch_size = int(batch.input_ids.shape[0])
+    if total_batch_size <= 0:
+        raise InvalidRequestError("batch must contain at least one datum")
+    if total_batch_size % micro_batch_size:
+        raise InvalidRequestError(
+            "logical batch size must be divisible by configured micro_batch_size: "
+            f"batch_size={total_batch_size}, micro_batch_size={micro_batch_size}"
+        )
+    if total_batch_size == micro_batch_size:
+        return [batch]
+    microbatches: list[MegatronTensorBatch] = []
+    for start in range(0, total_batch_size, micro_batch_size):
+        end = start + micro_batch_size
+        microbatches.append(
+            MegatronTensorBatch(
+                input_ids=batch.input_ids[start:end],
+                target_tokens=batch.target_tokens[start:end],
+                weights=batch.weights[start:end],
+            )
+        )
+    return microbatches
+
+
 def _core_forward_step_func(data_iterator, model):
     torch = _import_torch()
 
@@ -851,14 +895,18 @@ def _core_forward_step_func(data_iterator, model):
 def _extract_loss(losses_reduced: Any) -> float:
     if not losses_reduced:
         return 0.0
-    first = losses_reduced[0]
-    if isinstance(first, dict):
-        value = first.get("lm loss", first.get("loss", 0.0))
-    else:
-        value = first
-    if hasattr(value, "item"):
-        value = value.item()
-    return float(value)
+    values: list[float] = []
+    for item in losses_reduced:
+        if isinstance(item, dict):
+            value = item.get("lm loss", item.get("loss", 0.0))
+        else:
+            value = item
+        if hasattr(value, "item"):
+            value = value.item()
+        values.append(float(value))
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
 
 
 class MegatronTrainingBackend:
