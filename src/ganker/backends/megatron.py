@@ -1,5 +1,7 @@
 """Import-isolated Megatron training backend adapters."""
 
+# pyright: reportMissingImports=false
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -662,10 +664,23 @@ def _save_bridge_lora_adapter(
     )
     weights_path = checkpoint_dir / "adapter_model.safetensors"
     config_path = checkpoint_dir / "adapter_config.json"
+    if not weights_path.exists():
+        return {
+            "hf_adapter_path": str(checkpoint_dir),
+            "hf_adapter_config_path": str(config_path),
+            "hf_adapter_weights_path": str(weights_path),
+            "hf_adapter_written": False,
+            "hf_weight_format": "safetensors",
+            "hf_checkpoint_bytes": sum(
+                path.stat().st_size for path in checkpoint_dir.rglob("*") if path.is_file()
+            ),
+            "hf_weight_count": 0,
+        }
     return {
         "hf_adapter_path": str(checkpoint_dir),
         "hf_adapter_config_path": str(config_path),
         "hf_adapter_weights_path": str(weights_path),
+        "hf_adapter_written": True,
         "hf_weight_format": "safetensors",
         "hf_checkpoint_bytes": sum(
             path.stat().st_size for path in checkpoint_dir.rglob("*") if path.is_file()

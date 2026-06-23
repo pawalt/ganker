@@ -12,6 +12,7 @@ import json
 import importlib
 import os
 from argparse import Namespace
+from pathlib import Path
 from typing import Any
 
 import modal
@@ -25,48 +26,125 @@ from ganker.distributed.torchrun import (
     read_json,
     training_config_from_mapping,
 )
-from modal_apps.qwen_sft import infra as single_node_infra
 
 
-PROJECT_ROOT = single_node_infra.PROJECT_ROOT
-REMOTE_ROOT = single_node_infra.REMOTE_ROOT
-MODEL = os.getenv("GANKER_QWEN_SFT_MULTINODE_MODEL", single_node_infra.MODEL)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+REMOTE_ROOT = Path("/workspace/ganker")
+MODEL = os.getenv("GANKER_QWEN_SFT_MULTINODE_MODEL", "Qwen/Qwen3-0.6B")
 APP_NAME = os.getenv("GANKER_QWEN_SFT_MULTINODE_APP", "ganker-qwen-sft-multinode")
-REGION = os.getenv("GANKER_MODAL_REGION", single_node_infra.REGION)
+REGION = os.getenv("GANKER_MODAL_REGION", "us-east-1")
 GPU = os.getenv("GANKER_QWEN_SFT_MULTINODE_GPU", "H100:8")
 SINGLE_NODE_BASELINE_GPU = os.getenv(
     "GANKER_QWEN_SFT_SINGLE_NODE_GPU",
     os.getenv("GANKER_MODAL_GPU", "H100"),
 )
+BRIDGE_BASE_IMAGE = os.getenv("GANKER_MODAL_BRIDGE_BASE_IMAGE", "nvcr.io/nvidia/pytorch:26.02-py3")
+BRIDGE_REPO = os.getenv(
+    "GANKER_MEGATRON_BRIDGE_REPO",
+    "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git",
+)
+BRIDGE_REF = os.getenv("GANKER_MEGATRON_BRIDGE_REF", "v0.4.2")
+BRIDGE_UV_VERSION = os.getenv("GANKER_MEGATRON_BRIDGE_UV_VERSION", "0.7.2")
 CLUSTER_SIZE = int(os.getenv("GANKER_QWEN_SFT_MULTINODE_NODES", "2"))
 GPUS_PER_NODE = int(os.getenv("GANKER_QWEN_SFT_MULTINODE_GPUS_PER_NODE", str(parse_gpu_count(GPU))))
 MASTER_PORT = int(os.getenv("GANKER_QWEN_SFT_MULTINODE_MASTER_PORT", "29500"))
 RDMA_ENABLED = os.getenv("GANKER_QWEN_SFT_MULTINODE_RDMA", "1") != "0"
 EFA_ENABLED = os.getenv("GANKER_QWEN_SFT_MULTINODE_EFA", "1") != "0"
-ARTIFACT_ROOT = single_node_infra.ARTIFACT_ROOT
-ARTIFACT_MOUNT = single_node_infra.ARTIFACT_MOUNT
+ARTIFACT_VOLUME_NAME = os.getenv("GANKER_QWEN_SFT_ARTIFACT_VOLUME", "ganker-qwen-sft-artifacts")
+HF_CACHE_VOLUME_NAME = os.getenv("GANKER_HF_CACHE_VOLUME", "huggingface-cache")
+ARTIFACT_ROOT = Path(os.getenv("GANKER_QWEN_SFT_ARTIFACT_ROOT", "/vol/ganker-artifacts"))
+ARTIFACT_MOUNT = str(ARTIFACT_ROOT)
 DEFAULT_DATASET_PATH = REMOTE_ROOT / "examples" / "tiny_sft.jsonl"
 
 
-def _training_image() -> modal.Image:
-    return single_node_infra.bridge_image.run_commands(
-        (
-            "UV_PROJECT_ENVIRONMENT=/opt/venv "
-            "/root/.local/bin/uv pip install --python /opt/venv/bin/python "
-            "'datasets>=2.20' 'accelerate>=0.33' 'peft>=0.13' "
-            "'transformers>=4.51,<5' 'safetensors>=0.4'"
+def _repo_ignore() -> list[str]:
+    return [
+        ".git",
+        ".jj",
+        ".venv",
+        ".pytest_cache",
+        ".ruff_cache",
+        "__pycache__",
+        ".local_artifacts",
+    ]
+
+
+def _hf_secrets() -> list[modal.Secret]:
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    if not hf_token:
+        return []
+    return [
+        modal.Secret.from_dict(
+            {
+                "HF_TOKEN": hf_token,
+                "HUGGING_FACE_HUB_TOKEN": hf_token,
+            }
         )
+    ]
+
+
+def _training_image() -> modal.Image:
+    return (
+        modal.Image.from_registry(BRIDGE_BASE_IMAGE)
+        .apt_install(
+            "git",
+            "curl",
+            "libibverbs-dev",
+            "libibverbs1",
+            "libhwloc15",
+            "libnl-route-3-200",
+        )
+        .run_commands(
+            f"curl -LsSf https://astral.sh/uv/{BRIDGE_UV_VERSION}/install.sh | sh",
+            "rm -rf /opt/Megatron-Bridge /opt/venv",
+            (
+                "git clone --depth 1 --branch "
+                f"{BRIDGE_REF} --recurse-submodules --shallow-submodules "
+                f"{BRIDGE_REPO} /opt/Megatron-Bridge"
+            ),
+            "/root/.local/bin/uv venv /opt/venv --system-site-packages",
+            (
+                "cd /opt/Megatron-Bridge && "
+                "UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy "
+                "/root/.local/bin/uv sync --frozen --only-group build"
+            ),
+            (
+                "cd /opt/Megatron-Bridge && "
+                "UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy "
+                "MAX_JOBS=4 NVTE_BUILD_NUM_PHILOX_ROUNDS=3 "
+                "/root/.local/bin/uv sync --link-mode copy --frozen --no-dev "
+                "--no-install-package transformer-engine"
+            ),
+        )
+        .env(
+            {
+                "PATH": "/opt/venv/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "VIRTUAL_ENV": "/opt/venv",
+                "UV_PROJECT_ENVIRONMENT": "/opt/venv",
+                "PYTHONPATH": f"{REMOTE_ROOT}:{REMOTE_ROOT / 'src'}:/opt/Megatron-Bridge/src:/opt/Megatron-Bridge/3rdparty/Megatron-LM",
+                "GANKER_ARTIFACT_ROOT": ARTIFACT_MOUNT,
+                "HF_HUB_CACHE": "/root/.cache/huggingface",
+                "HF_XET_HIGH_PERFORMANCE": "1",
+                "HF_HUB_ENABLE_HF_TRANSFER": "1",
+            }
+        )
+        .add_local_dir(PROJECT_ROOT, remote_path=str(REMOTE_ROOT), ignore=_repo_ignore())
     )
 
 
 training_image = _training_image()
 app = modal.App(APP_NAME)
-artifact_volume = single_node_infra.artifact_volume
-hf_cache_volume = single_node_infra.hf_cache_volume
+artifact_volume = modal.Volume.from_name(ARTIFACT_VOLUME_NAME, create_if_missing=True)
+hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
 
 def add_remote_import_paths() -> None:
-    single_node_infra.add_remote_import_paths()
+    import sys
+
+    for path in (REMOTE_ROOT, REMOTE_ROOT / "src"):
+        path_text = str(path)
+        if path_text not in sys.path:
+            sys.path.insert(0, path_text)
 
 
 def distributed_training_config(
@@ -195,7 +273,7 @@ def _namespace_from_config(config: dict[str, Any], *, result_path: str) -> Names
         ARTIFACT_MOUNT: artifact_volume,
         "/root/.cache/huggingface": hf_cache_volume,
     },
-    secrets=single_node_infra._hf_secrets(),
+    secrets=_hf_secrets(),
     experimental_options={"efa_enabled": EFA_ENABLED},
 )
 @modal.experimental.clustered(size=CLUSTER_SIZE, rdma=RDMA_ENABLED)  # type: ignore[reportCallIssue,reportOptionalCall]
@@ -205,11 +283,12 @@ def run_clustered_trainer(config: dict[str, Any]) -> dict[str, Any]:
     distributed = _validate_cluster_config(config)
     cluster_info = modal.experimental.get_cluster_info()
     result_path = _result_path(config)
+    container_ips = [str(value) for value in cluster_info.container_ips]
     launch = TorchrunLaunchConfig(
         nnodes=distributed.n_nodes,
         nproc_per_node=distributed.gpus_per_node,
         node_rank=int(cluster_info.rank),
-        master_addr=str(cluster_info.container_ips[0]),
+        master_addr=container_ips[0],
         master_port=int(config.get("master_port", MASTER_PORT)),
     )
     entrypoint = REMOTE_ROOT / "modal_apps" / "qwen_sft_multinode" / "train_entry.py"
@@ -223,7 +302,7 @@ def run_clustered_trainer(config: dict[str, Any]) -> dict[str, Any]:
                 "event": "launch_torchrun",
                 "cluster_rank": cluster_info.rank,
                 "cluster_id": cluster_info.cluster_id,
-                "container_ips": cluster_info.container_ips,
+                "container_ips": container_ips,
                 "argv": args,
             },
             sort_keys=True,
@@ -252,7 +331,7 @@ def run_clustered_trainer(config: dict[str, Any]) -> dict[str, Any]:
         "region": REGION,
         "rdma_enabled": RDMA_ENABLED,
         "efa_enabled": EFA_ENABLED,
-        "container_ips": list(cluster_info.container_ips),
+        "container_ips": container_ips,
     }
     return payload
 
@@ -266,7 +345,7 @@ def run_clustered_trainer(config: dict[str, Any]) -> dict[str, Any]:
         ARTIFACT_MOUNT: artifact_volume,
         "/root/.cache/huggingface": hf_cache_volume,
     },
-    secrets=single_node_infra._hf_secrets(),
+    secrets=_hf_secrets(),
 )
 def run_single_node_ganker_baseline(config: dict[str, Any]) -> dict[str, Any]:
     add_remote_import_paths()
@@ -299,7 +378,7 @@ def run_single_node_ganker_baseline(config: dict[str, Any]) -> dict[str, Any]:
         ARTIFACT_MOUNT: artifact_volume,
         "/root/.cache/huggingface": hf_cache_volume,
     },
-    secrets=single_node_infra._hf_secrets(),
+    secrets=_hf_secrets(),
 )
 def prepare_real_sft_dataset(
     dataset_path: str,

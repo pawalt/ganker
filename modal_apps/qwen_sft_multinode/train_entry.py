@@ -115,7 +115,15 @@ def run_nccl_smoke(args: argparse.Namespace) -> None:
 def run_qwen_lora_sft(args: argparse.Namespace) -> None:
     distributed = _distributed_config(args)
     distributed.require_dp_only()
-    os.environ["GANKER_ARTIFACT_ROOT"] = str(args.artifact_root)
+    dist = importlib.import_module("torch.distributed")
+    rank = _rank()
+    world_size = _world_size()
+    artifact_root = (
+        Path(args.artifact_root)
+        if rank == 0
+        else Path("/tmp/ganker-rank-artifacts") / f"rank-{rank:05d}"
+    )
+    os.environ["GANKER_ARTIFACT_ROOT"] = str(artifact_root)
 
     config = MegatronBackendConfig(
         runtime_kind="bridge",
@@ -130,7 +138,7 @@ def run_qwen_lora_sft(args: argparse.Namespace) -> None:
         seed=int(args.seed),
     )
     backend = MegatronTrainingBackend(
-        FilesystemArtifactStore(Path(args.artifact_root)),
+        FilesystemArtifactStore(artifact_root),
         config=config,
     )
     run = backend.create_training_run(
@@ -139,9 +147,6 @@ def run_qwen_lora_sft(args: argparse.Namespace) -> None:
         lora_rank=int(args.lora_rank),
     )
 
-    dist = importlib.import_module("torch.distributed")
-    rank = _rank()
-    world_size = _world_size()
     tokenizer, batches = _load_batches(args)
     _ = tokenizer
 
@@ -168,17 +173,33 @@ def run_qwen_lora_sft(args: argparse.Namespace) -> None:
         optimizer_step = int(step_result.optimizer_step)
         checkpoint_version = int(step_result.checkpoint_version)
         losses.append(_average_scalar(float(fb.output.loss)))
+        if rank == 0:
+            print(
+                json.dumps(
+                    {
+                        "event": "qwen_lora_sft_step",
+                        "step": step + 1,
+                        "loss": losses[-1],
+                        "optimizer_step": optimizer_step,
+                        "checkpoint_version": checkpoint_version,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
-    saved = None
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
     if rank == 0:
-        saved = backend.save_weights(run_id=run.run_id, kind=ArtifactKind.DELTA)
+        print(json.dumps({"event": "qwen_lora_sft_save_start"}, sort_keys=True), flush=True)
+    saved = backend.save_weights(run_id=run.run_id, kind=ArtifactKind.DELTA)
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
+    if rank == 0:
+        print(json.dumps({"event": "qwen_lora_sft_save_done"}, sort_keys=True), flush=True)
 
     if rank == 0:
-        artifact_payload = _artifact_payload(saved.payload_path if saved is not None else "")
+        artifact_payload = _artifact_payload(saved.payload_path)
         write_json(
             args.result_path,
             {

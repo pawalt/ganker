@@ -10,6 +10,7 @@ from ganker.backends.megatron import (
     InProcessMegatronCoreRuntime,
     MegatronRunHandle,
     MegatronTrainingBackend,
+    _save_bridge_lora_adapter,
     _write_safetensors_state_dict,
     datums_to_tensor_batch,
 )
@@ -179,6 +180,31 @@ def test_safetensors_writer_clones_tied_tensors(tmp_path: Path):
     weights = safetensors.load_file(payload["hf_weights_path"])
     assert weights["model.embed_tokens.weight"].tolist() == [[0.0, 1.0], [2.0, 3.0]]
     assert weights["lm_head.weight"].tolist() == [[0.0, 1.0], [2.0, 3.0]]
+
+
+def test_bridge_lora_adapter_save_allows_non_writer_rank(tmp_path: Path):
+    class FakeBridge:
+        def __init__(self):
+            self.calls = []
+
+        def save_hf_adapter(self, model, checkpoint_dir, **kwargs):
+            self.calls.append((model, checkpoint_dir, kwargs))
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            (checkpoint_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    bridge = FakeBridge()
+    payload = _save_bridge_lora_adapter(
+        bridge=bridge,
+        model=object(),
+        base_model="local/tiny",
+        checkpoint_dir=tmp_path,
+        peft_config=object(),
+    )
+
+    assert bridge.calls
+    assert payload["hf_adapter_written"] is False
+    assert payload["hf_weight_count"] == 0
+    assert payload["hf_adapter_weights_path"] == str(tmp_path / "adapter_model.safetensors")
 
 
 class FakeMegatronRuntime:
