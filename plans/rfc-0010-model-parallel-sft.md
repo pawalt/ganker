@@ -513,7 +513,18 @@ larger model shapes need dedicated validation.
 - Run a short LoRA SFT smoke.
 - Serve with SGLang TP and load the exported adapter.
 
-Candidate commands should be written into README only after a smoke has passed.
+The first large-model command target is:
+
+```bash
+GANKER_QWEN_SFT_MULTINODE_NODES=2 \
+GANKER_QWEN_SFT_MULTINODE_GPU=H100:8 \
+uv run modal run modal_apps/qwen_large_model_parallel_sft/sft.py
+```
+
+That example defaults to `Qwen/Qwen3-32B` with `TP=8`, `PP=2`, `DP=1`,
+`global_batch_size=2`, and one optimizer step. It should be treated as a smoke
+target until a real GPU run proves model load, forward/backward, optimizer step,
+and adapter export.
 
 ## Testing Strategy
 

@@ -247,13 +247,25 @@ GANKER_QWEN_SFT_MULTINODE_GPU=H100:8 \
 uv run modal run modal_apps/qwen_pipeline_parallel_sft/sft.py
 ```
 
+Large-model TP+PP Qwen SFT:
+
+```bash
+source ~/.codex/modal.env
+GANKER_QWEN_SFT_MULTINODE_NODES=2 \
+GANKER_QWEN_SFT_MULTINODE_GPU=H100:8 \
+uv run modal run modal_apps/qwen_large_model_parallel_sft/sft.py
+```
+
 The multinode Qwen path has been validated on 2 nodes with `H100:8`,
 `world_size=16`, NCCL all-reduce, and a real Qwen3 0.6B Megatron Bridge LoRA
 step. The model-parallel Qwen path has been validated on 1 node with `H100:8`,
 `TP=2`, `PP=1`, `DP=4`, one real forward/backward/optimizer step, and HF/PEFT
 LoRA adapter export. The pipeline-parallel Qwen path has been validated on 1
 node with `H100:8`, `TP=2`, `PP=2`, `DP=2`, two Megatron microbatches, one real
-forward/backward/optimizer step, and HF/PEFT LoRA adapter export.
+forward/backward/optimizer step, and HF/PEFT LoRA adapter export. The
+large-model example defaults to `Qwen/Qwen3-32B`, `TP=8`, `PP=2`, `DP=1`, and
+two Modal `H100:8` nodes; it is added as the next smoke target and has not yet
+been GPU-validated.
 
 HF Trainer comparison:
 
