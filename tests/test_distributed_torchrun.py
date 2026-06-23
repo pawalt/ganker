@@ -76,7 +76,7 @@ def test_distributed_training_config_supports_tp_only_and_grad_accum():
     assert config.grad_accum_steps == 2
 
 
-def test_distributed_training_config_rejects_pp_until_forward_step_exists():
+def test_distributed_training_config_requires_pp_opt_in():
     config = DistributedTrainingConfig(
         n_nodes=1,
         gpus_per_node=8,
@@ -88,6 +88,37 @@ def test_distributed_training_config_rejects_pp_until_forward_step_exists():
 
     with pytest.raises(ValueError, match="pipeline_model_parallel_size"):
         config.require_supported_model_parallel()
+
+
+def test_distributed_training_config_supports_pp_when_opted_in():
+    config = DistributedTrainingConfig(
+        n_nodes=1,
+        gpus_per_node=8,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        micro_batch_size=1,
+        global_batch_size=4,
+    )
+
+    config.require_supported_model_parallel(allow_pipeline_parallel=True)
+
+    assert config.model_parallel_size == 4
+    assert config.data_parallel_size == 2
+    assert config.grad_accum_steps == 2
+
+
+def test_distributed_training_config_rejects_pp_with_too_few_microbatches():
+    config = DistributedTrainingConfig(
+        n_nodes=1,
+        gpus_per_node=8,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        micro_batch_size=1,
+        global_batch_size=2,
+    )
+
+    with pytest.raises(ValueError, match="grad_accum_steps"):
+        config.require_supported_model_parallel(allow_pipeline_parallel=True)
 
 
 def test_torchrun_launch_args_match_modal_cluster_shape():
@@ -196,7 +227,32 @@ def test_rank_info_from_global_rank_groups_contiguous_model_replicas():
     assert rank1.tensor_model_parallel_rank == 1
     assert rank2.data_parallel_rank == 1
     assert rank0.is_artifact_writer is True
+    assert rank0.is_loss_reporter is True
     assert rank1.is_artifact_writer is False
+    assert rank1.is_loss_reporter is False
+
+
+def test_rank_info_from_global_rank_handles_pipeline_parallel_groups():
+    config = DistributedTrainingConfig(
+        n_nodes=1,
+        gpus_per_node=8,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        micro_batch_size=1,
+        global_batch_size=4,
+    )
+
+    ranks = [rank_info_from_global_rank(config, global_rank=rank) for rank in range(4)]
+
+    assert [rank.data_parallel_rank for rank in ranks] == [0, 0, 0, 0]
+    assert [rank.tensor_model_parallel_rank for rank in ranks] == [0, 1, 0, 1]
+    assert [rank.pipeline_model_parallel_rank for rank in ranks] == [0, 0, 1, 1]
+    assert ranks[0].is_artifact_writer is True
+    assert ranks[0].is_loss_reporter is False
+    assert ranks[1].is_loss_reporter is False
+    assert ranks[2].is_artifact_writer is False
+    assert ranks[2].is_loss_reporter is True
+    assert ranks[3].is_loss_reporter is False
 
 
 def test_json_helpers_round_trip_rank_result(tmp_path: Path):

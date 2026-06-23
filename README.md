@@ -26,13 +26,17 @@ Working today:
 - Megatron-Core smoke tests using `get_forward_backward_func()`.
 - SGLang HTTP inference backend, including LoRA adapter loading.
 - Modal multinode torchrun harness with NCCL and Qwen LoRA SFT smokes.
+- Tensor-parallel and pipeline-parallel Qwen LoRA SFT smokes through Megatron
+  Bridge.
 - Code-SFT example modeled after Modal's StarCoder multinode guide.
 - HF Trainer comparison path for checking Ganker/Megatron loss curves.
 
 Current constraints:
 
-- The Megatron Bridge SFT path is data-parallel only: `tp=1`, `pp=1`.
-- The current distributed SFT loop requires `grad_accum_steps=1`.
+- The Megatron Bridge SFT path supports tested DP-only, TP-only, and `TP=2,
+  PP=2` smoke shapes, but larger model shapes still need dedicated validation.
+- Pipeline parallelism requires enough logical batch to produce at least one
+  microbatch per pipeline stage.
 - The most tested real model is `Qwen/Qwen3-0.6B`.
 - Local tests do not run real Megatron Bridge or SGLang; those run on Modal.
 - The StarCoder-style SGLang eval wrapper exists, but the last smoke attempt
@@ -234,11 +238,22 @@ GANKER_QWEN_SFT_MULTINODE_GPU=H100:8 \
 uv run modal run modal_apps/qwen_model_parallel_sft/sft.py
 ```
 
+Pipeline-parallel Qwen SFT:
+
+```bash
+source ~/.codex/modal.env
+GANKER_QWEN_SFT_MULTINODE_NODES=1 \
+GANKER_QWEN_SFT_MULTINODE_GPU=H100:8 \
+uv run modal run modal_apps/qwen_pipeline_parallel_sft/sft.py
+```
+
 The multinode Qwen path has been validated on 2 nodes with `H100:8`,
 `world_size=16`, NCCL all-reduce, and a real Qwen3 0.6B Megatron Bridge LoRA
 step. The model-parallel Qwen path has been validated on 1 node with `H100:8`,
 `TP=2`, `PP=1`, `DP=4`, one real forward/backward/optimizer step, and HF/PEFT
-LoRA adapter export.
+LoRA adapter export. The pipeline-parallel Qwen path has been validated on 1
+node with `H100:8`, `TP=2`, `PP=2`, `DP=2`, two Megatron microbatches, one real
+forward/backward/optimizer step, and HF/PEFT LoRA adapter export.
 
 HF Trainer comparison:
 

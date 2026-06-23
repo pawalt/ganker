@@ -1,6 +1,6 @@
 # RFC 0010: Model-Parallel SFT for Larger Models
 
-Status: TP milestone implemented; PP milestone draft
+Status: TP and PP smoke milestones implemented
 
 ## Summary
 
@@ -9,11 +9,12 @@ model-parallel training. The first target is tensor parallelism (`TP > 1`,
 `PP = 1`), followed by pipeline parallelism (`PP > 1`) once the data iterator,
 microbatching, and loss handling are Megatron-native enough.
 
-Implementation note: the TP-only milestone has landed for the Qwen LoRA SFT
-Modal path. The validated smoke is one Modal clustered node with `H100:8`,
-`TP=2`, `PP=1`, `DP=4`, one Qwen3 0.6B LoRA optimizer step, and HF/PEFT adapter
-export. PP remains explicitly unsupported until Ganker has a pipeline-aware
-forward step.
+Implementation note: the TP-only and PP smoke milestones have landed for the
+Qwen LoRA SFT Modal path. The validated TP smoke is one Modal clustered node
+with `H100:8`, `TP=2`, `PP=1`, `DP=4`, one Qwen3 0.6B LoRA optimizer step, and
+HF/PEFT adapter export. The validated PP smoke is one Modal clustered node with
+`H100:8`, `TP=2`, `PP=2`, `DP=2`, two Megatron microbatches, one Qwen3 0.6B LoRA
+optimizer step, and HF/PEFT adapter export.
 
 The goal is to make larger models fit by sharding one logical model across
 multiple GPUs. Data parallelism can increase throughput, but it cannot make a
@@ -393,7 +394,7 @@ uv run modal run modal_apps/qwen_sft_multinode/sft.py \
   --tensor-model-parallel-size 2 \
   --pipeline-model-parallel-size 2 \
   --micro-batch-size 1 \
-  --global-batch-size 8 \
+  --global-batch-size 4 \
   --max-steps 1 \
   --sequence-length 128
 ```
@@ -405,6 +406,20 @@ Success criteria:
 - loss is emitted from last stage and reduced for reporting;
 - optimizer step completes;
 - artifact export succeeds.
+
+### Implementation Result
+
+Megatron's non-interleaved pipeline schedule calls `set_input_tensor(...)` on
+non-first pipeline stages and only evaluates the returned loss closure on the
+last pipeline stage. Ganker's Bridge forward step can therefore keep passing the
+same token/label microbatch to every rank and let Megatron route activations
+between stages. The runtime change needed in Ganker was to:
+
+- allow PP through Qwen SFT validation when explicitly enabled;
+- require enough gradient-accumulation microbatches for the pipeline;
+- report loss only from `tensor_model_parallel_rank == 0` on the final pipeline
+  stage;
+- barrier after Bridge HF adapter export before checking shared artifacts.
 
 ## Serving Larger Models
 
@@ -453,9 +468,9 @@ Modal CLIs should keep exposing:
 --global-batch-size
 ```
 
-The README should stop saying the path is strictly DP-only after TP milestone 1
-lands, but it should still document PP as experimental until the PP smoke is
-green.
+The README should stop saying the path is strictly DP-only. It should document
+DP-only, TP-only, and PP smoke commands separately, while still calling out that
+larger model shapes need dedicated validation.
 
 ## Implementation Plan
 

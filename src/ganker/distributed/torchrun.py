@@ -42,6 +42,13 @@ class MegatronRankInfo:
             and self.pipeline_model_parallel_rank == 0
         )
 
+    @property
+    def is_loss_reporter(self) -> bool:
+        return (
+            self.tensor_model_parallel_rank == 0
+            and self.pipeline_model_parallel_rank == self.pipeline_model_parallel_size - 1
+        )
+
     def as_dict(self) -> dict[str, int | bool]:
         return {
             "global_rank": self.global_rank,
@@ -53,6 +60,7 @@ class MegatronRankInfo:
             "pipeline_model_parallel_rank": self.pipeline_model_parallel_rank,
             "pipeline_model_parallel_size": self.pipeline_model_parallel_size,
             "is_artifact_writer": self.is_artifact_writer,
+            "is_loss_reporter": self.is_loss_reporter,
         }
 
 
@@ -125,6 +133,13 @@ class DistributedTrainingConfig:
             raise ValueError(
                 "pipeline_model_parallel_size > 1 is not supported by the current "
                 "Qwen SFT entrypoint; TP-only model parallelism is supported first"
+            )
+        if (
+            self.pipeline_model_parallel_size > 1
+            and self.grad_accum_steps < self.pipeline_model_parallel_size
+        ):
+            raise ValueError(
+                "pipeline parallel SFT requires grad_accum_steps >= pipeline_model_parallel_size"
             )
 
     def as_dict(self) -> dict[str, int]:

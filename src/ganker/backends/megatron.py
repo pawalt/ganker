@@ -680,6 +680,7 @@ def _save_bridge_lora_adapter(
         base_model_name_or_path=base_model,
         show_progress=False,
     )
+    _distributed_barrier_if_initialized()
     weights_path = checkpoint_dir / "adapter_model.safetensors"
     config_path = checkpoint_dir / "adapter_config.json"
     if not weights_path.exists():
@@ -748,6 +749,15 @@ def _safetensors_tensor_count(path: Path) -> int:
 
     with safe_open(path, framework="pt", device="cpu") as handle:
         return len(handle.keys())
+
+
+def _distributed_barrier_if_initialized() -> None:
+    try:
+        import torch.distributed as dist
+    except Exception:
+        return
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 
 def _free_port() -> int:

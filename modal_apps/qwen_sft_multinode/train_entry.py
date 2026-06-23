@@ -116,7 +116,7 @@ def run_nccl_smoke(args: argparse.Namespace) -> None:
 
 def run_qwen_lora_sft(args: argparse.Namespace) -> None:
     distributed = _distributed_config(args)
-    distributed.require_supported_model_parallel()
+    distributed.require_supported_model_parallel(allow_pipeline_parallel=True)
     dist = importlib.import_module("torch.distributed")
     rank = _rank()
     shared_artifact_root = Path(args.artifact_root)
@@ -178,7 +178,12 @@ def run_qwen_lora_sft(args: argparse.Namespace) -> None:
         )
         optimizer_step = int(step_result.optimizer_step)
         checkpoint_version = int(step_result.checkpoint_version)
-        losses.append(_average_scalar(float(fb.output.loss)))
+        losses.append(
+            _average_scalar(
+                float(fb.output.loss),
+                include=rank_info.is_loss_reporter,
+            )
+        )
         if rank == 0:
             print(
                 json.dumps(
@@ -467,15 +472,17 @@ def _load_batches(args: argparse.Namespace):
     return tokenizer, batches
 
 
-def _average_scalar(value: float) -> float:
+def _average_scalar(value: float, *, include: bool = True) -> float:
     torch = importlib.import_module("torch")
     dist = importlib.import_module("torch.distributed")
     if not dist.is_available() or not dist.is_initialized():
         return float(value)
     device = torch.device("cuda", _local_rank()) if torch.cuda.is_available() else torch.device("cpu")
-    tensor = torch.tensor([value], dtype=torch.float32, device=device)
+    tensor = torch.tensor([value if include else 0.0], dtype=torch.float32, device=device)
+    count = torch.tensor([1.0 if include else 0.0], dtype=torch.float32, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    tensor /= dist.get_world_size()
+    dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    tensor /= count.clamp_min(1.0)
     return float(tensor.item())
 
 

@@ -239,7 +239,7 @@ def _validate_cluster_config(
             f"config={distributed.gpus_per_node} gpu={GPU!r} parsed={GPUS_PER_NODE}"
         )
     if config["mode"] == "qwen-lora-sft":
-        distributed.require_supported_model_parallel()
+        distributed.require_supported_model_parallel(allow_pipeline_parallel=True)
     elif config["mode"] == "hf-ddp-baseline":
         distributed.require_dp_only()
     return distributed
