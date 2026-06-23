@@ -111,6 +111,54 @@ Use an exact region such as `us-east-1`. Do not use a broad region such as
 `modal.experimental.clustered(...)` is only needed later for gang-scheduled
 multi-node training; it is not required for i6pn connectivity.
 
+## Clustered Multi-Node SFT
+
+The Qwen multi-node SFT path is separate from the Monarch role mesh above:
+
+```text
+modal_apps/qwen_sft_multinode/infra.py
+  -> Modal clustered function
+  -> fixed cluster size from GANKER_QWEN_SFT_MULTINODE_NODES
+  -> H100:8 full-node GPU request by default
+
+each clustered container
+  -> modal.experimental.get_cluster_info()
+  -> torch.distributed.run with one process per GPU
+  -> modal_apps/qwen_sft_multinode/train_entry.py
+
+each torchrun rank
+  -> initialize Megatron Bridge through MegatronTrainingBackend
+  -> run the same forward/backward schedule collectively
+  -> rank 0 writes the JSON result and adapter manifest
+```
+
+Forward/backward is scheduled by Megatron, not by Ganker:
+
+```text
+Ganker clustered job command
+  -> torchrun starts WORLD_SIZE ranks
+  -> every rank enters get_forward_backward_func()
+  -> Megatron/PyTorch collectives synchronize gradients and losses
+  -> rank 0 reports the logical step result
+```
+
+The first supported shape is data-parallel only:
+
+```text
+n_nodes = 2
+gpus_per_node = 8
+tp = 1
+pp = 1
+dp = 16
+global_batch_size = micro_batch_size * dp
+grad_accum_steps = 1
+```
+
+This proves Modal gang scheduling, `torchrun`, process-group initialization,
+dataset sharding, Megatron Bridge SFT, and LoRA adapter export. Tensor and
+pipeline parallelism remain future work because they add model-shard export and
+pipeline schedule validation beyond the Qwen3 0.6B LoRA target.
+
 ## Smoke Tests
 
 The preferred Qwen SFT example is intentionally narrow:
@@ -155,6 +203,50 @@ The comparison command skips SGLang and uses a trainer-only infra runner with a
 controller-local fake rollout actor, because loss-curve validation does not
 need rollout inference. This keeps the proxy contract intact while avoiding a
 second rollout GPU.
+
+The multi-node Qwen path is:
+
+```text
+modal_apps/qwen_sft_multinode/infra.py
+  -> clustered Modal app, H100:8 image, HF cache and artifact volumes
+
+modal_apps/qwen_sft_multinode/train_entry.py
+  -> torchrun child process
+  -> torchrun-env, nccl-smoke, qwen-lora-sft, hf-ddp-baseline modes
+
+modal_apps/qwen_sft_multinode/sft.py
+  -> one-command clustered smoke/SFT runner
+
+modal_apps/qwen_sft_multinode/compare_hf.py
+  -> materializes the shared dataset
+  -> runs multinode Ganker/Megatron Bridge
+  -> runs HF Trainer DDP on the same clustered shape
+  -> runs a single-node Ganker/Megatron baseline from the same Modal app
+```
+
+Run the staged clustered checks:
+
+```bash
+source ~/.codex/modal.env
+GANKER_QWEN_SFT_MULTINODE_NODES=2 uv run modal run modal_apps/qwen_sft_multinode/sft.py \
+  --mode torchrun-env
+GANKER_QWEN_SFT_MULTINODE_NODES=2 uv run modal run modal_apps/qwen_sft_multinode/sft.py \
+  --mode nccl-smoke
+GANKER_QWEN_SFT_MULTINODE_NODES=2 uv run modal run modal_apps/qwen_sft_multinode/sft.py \
+  --mode qwen-lora-sft \
+  --max-steps 1 \
+  --sequence-length 32
+```
+
+Run the longer loss comparison:
+
+```bash
+source ~/.codex/modal.env
+GANKER_QWEN_SFT_MULTINODE_NODES=2 uv run modal run modal_apps/qwen_sft_multinode/compare_hf.py \
+  --dataset-size 256 \
+  --max-steps 20 \
+  --sequence-length 256
+```
 
 The generic Modal harness remains available for lower-level smokes:
 

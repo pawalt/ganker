@@ -155,3 +155,51 @@ def test_qwen_sft_hf_comparison_example_compiles():
         ],
         check=True,
     )
+
+
+def test_qwen_sft_multinode_infra_compiles():
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            "modal_apps/qwen_sft_multinode/infra.py",
+        ],
+        check=True,
+    )
+
+
+def test_qwen_sft_multinode_train_entry_compiles():
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            "modal_apps/qwen_sft_multinode/train_entry.py",
+        ],
+        check=True,
+    )
+
+
+def test_qwen_sft_multinode_example_compiles():
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            "modal_apps/qwen_sft_multinode/sft.py",
+        ],
+        check=True,
+    )
+
+
+def test_qwen_sft_multinode_hf_comparison_compiles():
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            "modal_apps/qwen_sft_multinode/compare_hf.py",
+        ],
+        check=True,
+    )
