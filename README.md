@@ -1,120 +1,235 @@
 # Ganker
 
-Local singleton prototype for a Tinker-style training system orchestrated with PyTorch Monarch.
+Ganker is a local-first prototype of a Tinker-style training service. The
+client talks to a small Python API, while the service side can orchestrate a
+proxy, trainer, rollout server, and telemetry actor behind that API.
 
-The public API is a Python client:
+The current implementation is aimed at proving the contracts and end-to-end
+plumbing for:
+
+- granular `forward_backward` and `optim_step` training calls,
+- LoRA checkpoint export through Megatron Bridge,
+- SGLang-backed sampling through HTTP,
+- local Monarch orchestration for development,
+- Modal GPU jobs for real Megatron/SGLang execution,
+- lightweight tests for each component without requiring local GPUs.
+
+## Status
+
+Working today:
+
+- Public Python client API: `ServiceClient`, `TrainingClient`, and `SamplingClient`.
+- Local fake training and inference backends for CPU-only development.
+- Local Monarch mesh orchestration with proxy, trainer, rollout, and `TelemetryActor`.
+- gRPC proxy transport for clients that should not speak Monarch directly.
+- Megatron Bridge training backend with Qwen3 0.6B LoRA on Modal GPUs.
+- Megatron-Core smoke tests using `get_forward_backward_func()`.
+- SGLang HTTP inference backend, including LoRA adapter loading.
+- Modal multinode torchrun harness with NCCL and Qwen LoRA SFT smokes.
+- Code-SFT example modeled after Modal's StarCoder multinode guide.
+- HF Trainer comparison path for checking Ganker/Megatron loss curves.
+
+Current constraints:
+
+- The Megatron Bridge SFT path is data-parallel only: `tp=1`, `pp=1`.
+- The current distributed SFT loop requires `grad_accum_steps=1`.
+- The most tested real model is `Qwen/Qwen3-0.6B`.
+- Local tests do not run real Megatron Bridge or SGLang; those run on Modal.
+- The StarCoder-style SGLang eval wrapper exists, but the last smoke attempt
+  needed better SGLang startup observability, so treat that path as still being
+  hardened.
+
+## Architecture
+
+At the API level, users call a proxy:
+
+```text
+Python client
+    |
+    | ServiceClient / gRPC transport
+    v
+ProxyActor
+    |---------------- TrainingActor -> training backend
+    |---------------- RolloutActor  -> inference backend
+    |---------------- TelemetryActor
+```
+
+For local development, Monarch can run all actors in one process or as a local
+distributed mesh. For Modal runs, the trainer and inference processes can live
+on separate Modal functions and communicate over Modal private networking or
+through the exposed proxy API.
+
+See the architecture notes for more detail:
+
+- `architecture/overview.md`
+- `architecture/local-testing.md`
+- `architecture/distributed-modal.md`
+- `architecture/sampling-sglang.md`
+
+## Client API
+
+The client never needs to call Monarch actor handles directly.
 
 ```python
+from pathlib import Path
+
 from ganker import ServiceClient
 from ganker.contracts import AdamParams, Datum, ModelInput, SamplingParams, TensorData
 
-with ServiceClient.local("/tmp/ganker-artifacts") as client:
-    training_client = client.create_lora_training_client(
-        base_model="Qwen/Qwen3-8B",
-        rank=32,
+with ServiceClient.local(Path("/tmp/ganker-artifacts")) as client:
+    training = client.create_lora_training_client(
+        base_model="Qwen/Qwen3-0.6B",
+        rank=8,
     )
 
     datum = Datum(
-        model_input=ModelInput.from_ints(tokens=[1, 2, 3]),
+        model_input=ModelInput.from_ints([1, 2, 3]),
         loss_fn_inputs={
-            "target_tokens": TensorData.from_ints([2, 3, 4]),
+            "target_tokens": TensorData.from_ints([2, 3, 0]),
             "weights": TensorData.from_floats([0.0, 1.0, 1.0]),
         },
     )
 
-    training_client.forward_backward([datum], loss_fn="cross_entropy")
-    training_client.optim_step(params=AdamParams(learning_rate=1e-4))
+    training.forward_backward([datum], loss_fn="cross_entropy")
+    training.optim_step(params=AdamParams(learning_rate=1e-4))
 
-    sampling_client = training_client.save_weights_and_get_sampling_client()
-    sample = sampling_client.sample(
-        ModelInput.from_ints(tokens=[1, 2, 3]),
-        SamplingParams(max_tokens=8),
-    )
-    print(sample.sequences[0].tokens)
-
-    text_sample = sampling_client.sample_text(
+    sampler = training.save_weights_and_get_sampling_client()
+    response = sampler.sample_text(
         "Write one sentence about Monarch.",
         SamplingParams(max_tokens=16, temperature=0.7, top_p=0.9),
     )
-    print(text_sample.sequences[0].text)
+    print(response.sequences[0].text)
 ```
 
-Internally, the project models the high-level flows between:
-
-- a proxy actor behind the public client,
-- a training server,
-- a rollout server,
-- and a general `TelemetryActor`.
-
-Production backends are expected to be Megatron for training and `sglang` for
-inference. Local development defaults to fake backends so the contracts and
-component behavior can be tested without GPU dependencies.
-
-Internal orchestration uses Monarch actor endpoints instead of gRPC. The client
-speaks a clear proxy API through a transport adapter and does not call Monarch
-actor handles directly.
-
-## Development
-
-```bash
-uv run pytest
-```
-
-The default suite stays CPU-only and does not require Megatron Bridge, `sglang`,
-CUDA, model weights, or checkpoints.
-
-The controller/proxy/trainer/rollout split can be exercised locally without
-Modal or GPUs:
+For a local distributed actor mesh:
 
 ```python
+from pathlib import Path
+
 from ganker import ServiceClient
 
-with ServiceClient.local_distributed("/tmp/ganker-distributed-artifacts") as client:
-    training_client = client.create_lora_training_client("Qwen/Qwen3-0.6B")
+with ServiceClient.local_distributed(Path("/tmp/ganker-distributed")) as client:
+    training = client.create_lora_training_client(
+        base_model="Qwen/Qwen3-0.6B",
+        rank=8,
+    )
 ```
 
 That starts local Monarch worker listeners for trainer and rollout, registers
-their loopback endpoints, and has the controller attach to them with
-`attach_to_workers`.
+their loopback endpoints, and has the controller attach to them.
 
-SGLang backend contract tests also stay CPU-only by injecting fake HTTP/runtime
-objects:
+## Development
+
+Install and run with `uv`:
 
 ```bash
-uv run pytest tests/test_sglang_backend.py
+uv sync
+uv run pytest
+uv run ruff check .
+uv run pyright src examples modal_apps/starcoder_ganker \
+  tests/test_code_sft_data.py \
+  tests/test_sglang_backend.py
 ```
 
-The real SGLang adapter can either attach to an existing SGLang HTTP endpoint
-with `SGLangBackendConfig(base_url=...)` or launch
-`python -m sglang.launch_server` with `launch_server=True`.
+The default pytest suite is CPU-only. It does not require CUDA, Megatron Bridge,
+SGLang, model weights, or checkpoints.
 
-Real SGLang execution is tested on Modal with a GPU:
+Useful focused tests:
+
+```bash
+uv run pytest tests/test_client.py tests/test_components.py
+uv run pytest tests/test_distributed_torchrun.py
+uv run pytest tests/test_sglang_backend.py
+uv run pytest -m megatron_cpu
+```
+
+The full suite currently passes, though Monarch may print an ignored atexit
+timeout after pytest has already reported success. A broad Pyright run over
+`tests/modal_smoke/` is expected to report missing `torch` and Megatron imports
+in the local CPU environment; those modules are executed inside Modal GPU
+images.
+
+## Backends
+
+`fake`
+: Deterministic CPU-only training and inference backends used by most tests.
+
+`megatron`
+: Import-isolated training backend. Locally it can be tested with fake runtime
+objects and tiny Megatron-Core smokes. On Modal it can run Megatron Bridge with
+real HF model weights and LoRA export.
+
+`sglang`
+: HTTP inference backend. It can connect to an existing SGLang server with
+`SGLangBackendConfig(base_url=...)` or launch `python -m sglang.launch_server`
+with `launch_server=True`.
+
+## Modal Setup
+
+Modal commands assume the project-specific environment:
 
 ```bash
 source ~/.codex/modal.env
-modal run modal_apps/sglang_smoke.py --mode client
 ```
 
-That smoke starts SGLang for `Qwen/Qwen3-0.6B`, then samples through
-`ServiceClient.local(..., inference_backend="sglang")`.
+Use exact Modal regions for private networking. This repo defaults to
+`us-east-1`.
 
-The clean Qwen SFT Modal example is split into one infra file and one training
-file:
+## Modal Smokes
+
+Megatron environment and training smokes:
+
+```bash
+uv run modal run modal_apps/megatron_smoke.py --mode env
+uv run modal run modal_apps/megatron_smoke.py --mode pytest-cpu
+uv run modal run modal_apps/megatron_smoke.py --mode megatron
+uv run modal run modal_apps/megatron_smoke.py --mode ganker
+```
+
+SGLang smoke:
+
+```bash
+uv run modal run modal_apps/sglang_smoke.py --mode client
+```
+
+The `megatron` smoke runs a tiny synthetic GPT step through Megatron-Core's
+`get_forward_backward_func()`. The `ganker` smoke runs the same kind of step
+through the public client/proxy/training path.
+
+## Qwen SFT Examples
+
+Single-node Qwen SFT shape:
 
 ```bash
 source ~/.codex/modal.env
 GANKER_MODAL_GPU=A100 uv run modal deploy modal_apps/qwen_sft/infra.py
-GANKER_MODAL_GPU=A100 uv run modal run modal_apps/qwen_sft/sft.py --startup-timeout 900 --sglang-startup-timeout 900
+GANKER_MODAL_GPU=A100 uv run modal run modal_apps/qwen_sft/sft.py \
+  --startup-timeout 900 \
+  --sglang-startup-timeout 900
 ```
 
-`modal_apps/qwen_sft/infra.py` deploys only the Qwen3 0.6B Megatron Bridge
-trainer plus SGLang rollout shape. `modal_apps/qwen_sft/sft.py` is the
-Tinker-style example: create batches, call `TrainingClient`, save weights,
-refresh rollout, and sample through `SamplingClient`.
+Multinode torchrun Qwen SFT:
 
-The longer real-data validation path compares the Megatron Bridge/Ganker loss
-curve against a Hugging Face Trainer + PEFT LoRA baseline on the same
-materialized Alpaca-style JSONL file:
+```bash
+source ~/.codex/modal.env
+GANKER_QWEN_SFT_MULTINODE_NODES=2 \
+uv run modal run modal_apps/qwen_sft_multinode/sft.py --mode torchrun-env
+
+GANKER_QWEN_SFT_MULTINODE_NODES=2 \
+uv run modal run modal_apps/qwen_sft_multinode/sft.py --mode nccl-smoke
+
+GANKER_QWEN_SFT_MULTINODE_NODES=2 \
+uv run modal run modal_apps/qwen_sft_multinode/sft.py \
+  --mode qwen-lora-sft \
+  --max-steps 1 \
+  --sequence-length 32
+```
+
+The multinode Qwen path has been validated on 2 nodes with `H100:8`,
+`world_size=16`, NCCL all-reduce, and a real Qwen3 0.6B Megatron Bridge LoRA
+step.
+
+HF Trainer comparison:
 
 ```bash
 source ~/.codex/modal.env
@@ -125,105 +240,102 @@ GANKER_MODAL_GPU=A100 uv run modal run modal_apps/qwen_sft/compare_hf.py \
   --sequence-length 256
 ```
 
-`compare_hf.py` writes `tatsu-lab/alpaca` examples into the Modal artifact
-volume, runs a trainer-only Ganker/Megatron Bridge job over that file, runs a
-HF Trainer baseline with matching shifted targets, loss masks, LoRA rank,
-learning rate, and Adam optimizer shape, then prints a JSON report with both
-loss curves and simple agreement metrics.
+This materializes Alpaca-style JSONL, runs Ganker/Megatron Bridge, runs a
+matching HF Trainer + PEFT LoRA baseline, then prints both loss curves and
+agreement metrics.
 
-The generic distributed Modal harness remains available for lower-level smokes
-and back-compat:
+## Code SFT Example
 
-```bash
-source ~/.codex/modal.env
-uv run modal deploy modal_apps/distributed/infra.py
-uv run modal run modal_apps/distributed/sft_job.py --mode tcp-smoke --port 26620
-uv run modal run modal_apps/distributed/sft_job.py --mode fake-distributed --port 26600 --controller-port 26610
-uv run modal run modal_apps/distributed/sft_job.py --mode sft-distributed --port 26600 --controller-port 26610
-GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed/sft_job.py --mode qwen-bridge-sft-distributed --port 26600 --controller-port 26610 --startup-timeout 900 --tuning lora --lora-rank 8 --max-steps 1 --sequence-length 32 --micro-batch-size 1
-GANKER_MODAL_GPU=A100 uv run modal run modal_apps/distributed/sft_job.py --mode qwen-bridge-sglang-distributed --port 26600 --controller-port 26610 --startup-timeout 900 --sglang-startup-timeout 900 --tuning lora --lora-rank 8 --max-steps 1 --sequence-length 32 --micro-batch-size 1
-```
-
-`modal_apps/distributed/infra.py` owns images, Modal functions, volumes,
-worker rendezvous, and Monarch attach. `modal_apps/distributed/sft_job.py`
-contains the Tinker-style client code that trains, saves, refreshes rollout,
-and samples. The compatibility wrapper at `modal_apps/distributed_mesh.py`
-still forwards the old commands. All i6pn roles must be pinned to the same
-exact region, currently `us-east-1`.
-
-Megatron adapter preflight tests run locally without a GPU:
-
-```bash
-uv run pytest -m megatron_cpu
-```
-
-Those tests cover import isolation, backend config mapping, Datum-to-tensor
-conversion when torch is installed, and the mocked Megatron runtime lifecycle.
-They do not run real Megatron forward/backward.
-
-Real Megatron-Core execution is tested through the Modal GPU smoke path:
+`modal_apps/starcoder_ganker/` mirrors the workflow shape of Modal's StarCoder
+multinode training guide, but uses Ganker for training.
 
 ```bash
 source ~/.codex/modal.env
-modal run modal_apps/megatron_smoke.py --mode env
-modal run modal_apps/megatron_smoke.py --mode pytest-cpu
-modal run modal_apps/megatron_smoke.py --mode megatron
-modal run modal_apps/megatron_smoke.py --mode ganker
+
+uv run modal run modal_apps/starcoder_ganker/download_dataset.py \
+  --max-examples 256
+
+GANKER_STARCODER_NODES=2 \
+uv run modal run modal_apps/starcoder_ganker/sft.py \
+  --max-steps 10 \
+  --sequence-length 512
+
+uv run modal run modal_apps/starcoder_ganker/evaluate.py \
+  --run-id meg-run-000001
 ```
 
-The `env` mode reports CUDA, torch, Megatron-Core, and Megatron Bridge
-availability. The `pytest-cpu` mode runs the repo's CPU suite inside the Modal
-image. The `megatron` mode runs a tiny synthetic GPT training step using
-Megatron-Core's `get_forward_backward_func()`, takes one optimizer step, and
-writes a checkpoint under `/tmp/ganker-megatron-smoke` in the Modal container.
-The `ganker` mode runs the same kind of tiny Megatron-Core training step
-through the public `ServiceClient -> ProxyActor -> TrainingActor` path.
-The underlying smoke modes live in `tests/modal_smoke/` so they can be imported
-and unit-tested locally while still executing inside Modal.
+Defaults:
 
-Useful overrides:
+- Dataset: `bigcode/the-stack-smol-xs`, so the example can run without gated
+  BigCode access.
+- Model: `Qwen/Qwen3-0.6B`.
+
+For the exact gated StarCoderData source:
 
 ```bash
-GANKER_MODAL_GPU=A100 modal run modal_apps/megatron_smoke.py --mode megatron
-GANKER_MODAL_BASE_IMAGE=nvcr.io/nvidia/pytorch:<tag> modal run modal_apps/megatron_smoke.py --mode megatron
-modal run modal_apps/megatron_smoke.py --mode megatron --num-steps 2 --sequence-length 32
+GANKER_STARCODER_DATASET_ID=bigcode/starcoderdata \
+uv run modal run modal_apps/starcoder_ganker/download_dataset.py \
+  --languages go,rust \
+  --max-examples 256
 ```
 
-The Modal app intentionally does not install Megatron Bridge yet; the direct
-real-training smoke uses Megatron-Core only. Megatron Bridge is still needed
-later for Hugging Face conversion, production model providers, and export.
-
-Toy SFT over the public Ganker API runs through a dedicated Modal app:
+For a cheaper debug training run:
 
 ```bash
-source ~/.codex/modal.env
-modal run modal_apps/sft.py --mode env
-modal run modal_apps/sft.py --mode toy-sft
-modal run modal_apps/sft.py --mode hf-small-sft --max-steps 1 --sequence-length 32
-modal run modal_apps/sft.py --mode hf-small-sft --tuning lora --lora-rank 8 --max-steps 1 --sequence-length 32
+uv run modal run modal_apps/starcoder_ganker/sft.py \
+  --single-node \
+  --max-steps 1 \
+  --sequence-length 32
 ```
 
-The first SFT path lives under `examples/sft/`, uses a deterministic toy
-tokenizer, converts `examples/tiny_sft.jsonl` into `Datum` batches, and drives
-`ServiceClient -> TrainingClient` with full fine-tuning semantics against the
-tiny Megatron-Core runtime.
+This one-step path has been validated with Qwen3 0.6B through Megatron Bridge
+and writes a PEFT-compatible HF LoRA adapter.
 
-The `hf-small-sft` mode runs Qwen3 0.6B through Megatron Bridge inside a
-controlled Bridge image. By default the Modal image starts from
-`nvcr.io/nvidia/pytorch:26.02-py3`, clones
-`NVIDIA-NeMo/Megatron-Bridge@v0.4.2`, and installs from Bridge's own
-`uv.lock`. It loads pretrained HF weights and supports either full tuning or
-LoRA through the same public Ganker client path. Full tuning exports an HF
-safetensors checkpoint; LoRA exports a PEFT-compatible
-`adapter_config.json` plus `adapter_model.safetensors`.
+## Repository Layout
 
-Useful Bridge image overrides:
+```text
+src/ganker/
+  client.py              public client API
+  actors.py              proxy, training, rollout, telemetry actors
+  contracts.py           request/response and data contracts
+  backends/              fake, Megatron, and SGLang backends
+  distributed/           Monarch and torchrun helper contracts
+  rpc/                   gRPC proxy transport
+
+examples/sft/
+  data.py                SFT datum encoding helpers
+  real_data.py           Alpaca-style dataset materialization
+  code_data.py           code dataset materialization
+
+modal_apps/
+  megatron_smoke.py      Megatron-Core and Ganker GPU smokes
+  sglang_smoke.py        SGLang sampling smoke
+  qwen_sft/              single-node Qwen SFT shape
+  qwen_sft_multinode/    clustered torchrun Qwen SFT
+  starcoder_ganker/      code-SFT workflow modeled after StarCoder
+  distributed/           older distributed harness and compatibility path
+
+architecture/            high-level architecture notes and diagrams
+plans/                   RFCs for major design milestones
+tests/                   CPU-only unit and integration tests
+```
+
+## Version Control
+
+This repository uses `jj` for version control. Common commands:
 
 ```bash
-GANKER_MODAL_BRIDGE_BASE_IMAGE=nvcr.io/nvidia/pytorch:<tag> \
-GANKER_MEGATRON_BRIDGE_REF=v0.4.2 \
-GANKER_MODAL_TORCHMONARCH_VERSION=0.5.0 \
-modal run modal_apps/sft.py --mode hf-small-sft --tuning lora
+jj status
+jj diff
+jj describe -m "message"
+jj bookmark move main --to @
+jj git push --bookmark main
 ```
 
-See `architecture/` for the local orchestration diagrams.
+If SSH-backed `jj` commands hang in Codex, check the loaded agent socket:
+
+```bash
+find /tmp -maxdepth 2 -type s | grep ssh
+SSH_AUTH_SOCK=/tmp/ssh-.../agent... ssh-add -l
+SSH_AUTH_SOCK=/tmp/ssh-.../agent... jj git push --bookmark main
+```
