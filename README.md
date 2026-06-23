@@ -263,9 +263,9 @@ step. The model-parallel Qwen path has been validated on 1 node with `H100:8`,
 LoRA adapter export. The pipeline-parallel Qwen path has been validated on 1
 node with `H100:8`, `TP=2`, `PP=2`, `DP=2`, two Megatron microbatches, one real
 forward/backward/optimizer step, and HF/PEFT LoRA adapter export. The
-large-model example defaults to `Qwen/Qwen3-32B`, `TP=8`, `PP=2`, `DP=1`, and
-two Modal `H100:8` nodes; it is added as the next smoke target and has not yet
-been GPU-validated.
+large-model example has been validated on 2 nodes with `H100:8`,
+`Qwen/Qwen3-32B`, `TP=8`, `PP=2`, `DP=1`, two Megatron microbatches, one real
+forward/backward/optimizer step, and HF/PEFT LoRA adapter export.
 
 HF Trainer comparison:
 

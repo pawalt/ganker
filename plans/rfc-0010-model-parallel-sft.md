@@ -522,9 +522,11 @@ uv run modal run modal_apps/qwen_large_model_parallel_sft/sft.py
 ```
 
 That example defaults to `Qwen/Qwen3-32B` with `TP=8`, `PP=2`, `DP=1`,
-`global_batch_size=2`, and one optimizer step. It should be treated as a smoke
-target until a real GPU run proves model load, forward/backward, optimizer step,
-and adapter export.
+`global_batch_size=2`, and one optimizer step. It has been validated on Modal
+with two `H100:8` clustered nodes: Bridge loaded all 16 model-parallel shards,
+reported roughly 2.05B parameters per `(tensor, pipeline)` rank, completed one
+forward/backward/optimizer step with final loss `4.063220977783203`, and
+exported an HF/PEFT LoRA adapter with 896 safetensors weights.
 
 ## Testing Strategy
 
