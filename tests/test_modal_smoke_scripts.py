@@ -203,3 +203,22 @@ def test_qwen_sft_multinode_hf_comparison_compiles():
         ],
         check=True,
     )
+
+
+def test_starcoder_ganker_modal_files_compile():
+    for path in [
+        "modal_apps/starcoder_ganker/common.py",
+        "modal_apps/starcoder_ganker/infra.py",
+        "modal_apps/starcoder_ganker/download_dataset.py",
+        "modal_apps/starcoder_ganker/sft.py",
+        "modal_apps/starcoder_ganker/evaluate.py",
+    ]:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "py_compile",
+                path,
+            ],
+            check=True,
+        )

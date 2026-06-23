@@ -364,7 +364,20 @@ class SGLangHTTPRuntime:
             return
         self.close()
         self._loaded_loras.clear()
-        self._process = subprocess.Popen(self.server_cmd(model_path))
+        cmd = self.server_cmd(model_path)
+        print(
+            json.dumps(
+                {
+                    "event": "sglang_launch_server",
+                    "model_path": model_path,
+                    "base_url": self.base_url,
+                    "cmd": cmd,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        self._process = subprocess.Popen(cmd)
         self._active_model_path = model_path
         self._wait_for_health()
 
